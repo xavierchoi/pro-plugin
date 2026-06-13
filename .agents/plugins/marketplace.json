@@ -1,0 +1,20 @@
+{
+  "name": "pro-plugin",
+  "interface": {
+    "displayName": "Pro Plugin"
+  },
+  "plugins": [
+    {
+      "name": "pro-plugin",
+      "source": {
+        "source": "local",
+        "path": "./plugins/pro-plugin"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}
