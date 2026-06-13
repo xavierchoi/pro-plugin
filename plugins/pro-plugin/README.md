@@ -10,7 +10,17 @@ It does not read or store ChatGPT credentials. It connects to Chrome or Chromium
 npm install
 ```
 
-## Start a browser session
+## Start a browser session from Codex
+
+In a Codex thread, ask:
+
+```text
+ChatGPT Pro browser setup을 해줘.
+```
+
+Codex should call `setup_chatgpt_pro_browser`, which starts Comet or Chrome with CDP enabled and opens ChatGPT. Complete login and 2FA manually in the browser window, then ask Codex to check status.
+
+## Manual browser session
 
 Use a dedicated profile so remote debugging is scoped to this workflow:
 
@@ -56,6 +66,7 @@ Do not expose the debugging port to an untrusted network. CDP can control the br
 
 ## Tools
 
+- `setup_chatgpt_pro_browser`: starts or verifies a local Comet/Chrome CDP browser and opens ChatGPT.
 - `chatgpt_pro_status`: checks CDP reachability, SSH/tunnel hints, ChatGPT tab visibility, login/composer state, and visible model hints.
 - `ask_chatgpt_pro`: opens ChatGPT, tries to select Pro mode, submits a prompt, waits for the answer to stabilize, and returns the final text.
 

@@ -7,7 +7,9 @@ description: Use when the user asks Codex to consult ChatGPT Pro, GPT-5.5 Pro, t
 
 Use the `ask_chatgpt_pro` MCP tool when the user explicitly asks for ChatGPT Pro, GPT-5.5 Pro, the chatgpt.com Pro mode, or a Pro-mode second opinion.
 
-Before calling the tool, make sure the user has a Chrome, Comet, or other Chromium-based browser instance running with remote debugging enabled and already logged into `https://chatgpt.com`.
+Before calling `ask_chatgpt_pro`, make sure the user has a Chrome, Comet, or other Chromium-based browser instance running with remote debugging enabled and already logged into `https://chatgpt.com`.
+
+If the user asks to set up the browser, connect ChatGPT Pro, prepare Comet, or otherwise wants the setup handled inside Codex, call `setup_chatgpt_pro_browser` first. After it launches the browser, tell the user to complete ChatGPT login and 2FA in that browser window, then call `chatgpt_pro_status`.
 
 Default local endpoint:
 
@@ -39,6 +41,8 @@ If the tool reports that ChatGPT is not logged in, ask the user to open that bro
 
 When using the tool:
 
+- Prefer `setup_chatgpt_pro_browser` over asking the user to run shell commands manually.
+- Call `chatgpt_pro_status` before the first Pro request in a new Codex thread.
 - Prefer `conversation_mode: "new"` for isolated questions.
 - Use `session_name` with `conversation_mode: "named"` for a deliberate multi-turn Pro-mode review thread.
 - Use `require_pro_mode: true` unless the user says best-effort is acceptable.

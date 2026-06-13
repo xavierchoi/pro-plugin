@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 
 import { createInterface } from "node:readline";
+import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -15,8 +17,49 @@ const DEFAULT_MAX_PROMPT_CHARS = Number(
 const SESSION_STORE_PATH =
   process.env.CHATGPT_PRO_SESSION_STORE ||
   join(homedir(), ".cache", "pro-plugin", "sessions.json");
+const DEFAULT_CDP_PORT = Number(process.env.CHATGPT_PRO_CDP_PORT || 9222);
 
 const tools = [
+  {
+    name: "setup_chatgpt_pro_browser",
+    description:
+      "Start or verify a local Chrome/Comet browser with CDP enabled for ChatGPT Pro.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        browser: {
+          type: "string",
+          enum: ["comet", "chrome", "auto"],
+          default: "auto",
+          description:
+            "Browser to launch. auto prefers Comet on macOS, then Chrome/Chromium.",
+        },
+        cdp_port: {
+          type: "integer",
+          minimum: 1024,
+          maximum: 65535,
+          default: DEFAULT_CDP_PORT,
+          description: "Local CDP port to use.",
+        },
+        executable_path: {
+          type: "string",
+          description:
+            "Optional explicit browser executable path, useful when Comet is installed outside /Applications.",
+        },
+        profile_dir: {
+          type: "string",
+          description:
+            "Optional browser user-data-dir. Defaults to a dedicated pro-plugin cache profile.",
+        },
+        open_url: {
+          type: "string",
+          default: CHATGPT_URL,
+          description: "URL to open after launching the browser.",
+        },
+      },
+      additionalProperties: false,
+    },
+  },
   {
     name: "chatgpt_pro_status",
     description:
@@ -160,6 +203,9 @@ async function dispatch(method, params) {
 
   if (method === "tools/call") {
     const { name, arguments: args = {} } = params;
+    if (name === "setup_chatgpt_pro_browser") {
+      return textResult(await setupBrowser(args));
+    }
     if (name === "chatgpt_pro_status") {
       return textResult(await status(args));
     }
@@ -174,6 +220,104 @@ async function dispatch(method, params) {
   }
 
   throw new Error(`Unsupported MCP method: ${method}`);
+}
+
+async function setupBrowser(args) {
+  const port = Number(args.cdp_port || DEFAULT_CDP_PORT);
+  const endpoint = `http://127.0.0.1:${port}`;
+  const openUrl = args.open_url || CHATGPT_URL;
+
+  const existing = await probeCdp(endpoint);
+  if (existing.ok) {
+    return JSON.stringify(
+      {
+        ok: true,
+        already_running: true,
+        endpoint,
+        browser: existing.version?.Browser || existing.version,
+        next_steps: [
+          "Open or focus the ChatGPT tab in the CDP-enabled browser.",
+          "Complete ChatGPT login and 2FA manually if prompted.",
+          "Run chatgpt_pro_status, then ask_chatgpt_pro.",
+        ],
+      },
+      null,
+      2,
+    );
+  }
+
+  const selection = selectBrowserExecutable(args.browser || "auto", args.executable_path);
+  if (!selection.executable) {
+    return JSON.stringify(
+      {
+        ok: false,
+        endpoint,
+        checks: [
+          {
+            name: "browser_executable",
+            ok: false,
+            detail: selection.reason,
+          },
+        ],
+        next_steps: [
+          "Install Comet/Chrome or pass executable_path to setup_chatgpt_pro_browser.",
+          "On macOS Comet is usually /Applications/Comet.app/Contents/MacOS/Comet.",
+        ],
+      },
+      null,
+      2,
+    );
+  }
+
+  const profileDir =
+    args.profile_dir ||
+    join(
+      homedir(),
+      ".cache",
+      selection.kind === "comet"
+        ? "codex-chatgpt-pro-comet-profile"
+        : "codex-chatgpt-pro-browser-profile",
+    );
+  await mkdir(profileDir, { recursive: true });
+
+  const launchArgs = [
+    `--remote-debugging-port=${port}`,
+    `--user-data-dir=${profileDir}`,
+    openUrl,
+  ];
+  const child = spawn(selection.executable, launchArgs, {
+    detached: true,
+    stdio: "ignore",
+  });
+  child.unref();
+
+  const ready = await waitForCdp(endpoint, 10000);
+  return JSON.stringify(
+    {
+      ok: ready.ok,
+      launched: true,
+      endpoint,
+      browser: selection.kind,
+      executable: selection.executable,
+      profile_dir: profileDir,
+      pid: child.pid,
+      cdp_ready: ready.ok,
+      browser_version: ready.version?.Browser || ready.version || null,
+      next_steps: ready.ok
+        ? [
+            "Complete ChatGPT login and 2FA manually in the opened browser window if prompted.",
+            "Run chatgpt_pro_status to verify composer and Pro mode visibility.",
+            "Then ask ChatGPT Pro from Codex.",
+          ]
+        : [
+            "The browser process was started but CDP did not respond within 10 seconds.",
+            "Check whether the browser blocked remote-debugging flags or whether another instance is reusing the profile.",
+            `Try opening ${endpoint}/json/version manually.`,
+          ],
+    },
+    null,
+    2,
+  );
 }
 
 async function status(args) {
@@ -255,7 +399,7 @@ async function status(args) {
 
   if (!diagnostics.checks.find((check) => check.name === "cdp_endpoint")?.ok) {
     diagnostics.next_steps.push(
-      "Start Chrome or Comet with --remote-debugging-port=9222.",
+      "Run setup_chatgpt_pro_browser to start Chrome or Comet with CDP enabled.",
     );
     if (diagnostics.environment.is_ssh) {
       diagnostics.next_steps.push(
@@ -777,6 +921,94 @@ function normalizeUrl(url) {
     return parsed.toString();
   } catch {
     return url;
+  }
+}
+
+function selectBrowserExecutable(browser, explicitPath) {
+  if (explicitPath) {
+    return existsSync(explicitPath)
+      ? { kind: browser === "auto" ? "custom" : browser, executable: explicitPath }
+      : { kind: browser, executable: "", reason: `Path does not exist: ${explicitPath}` };
+  }
+
+  const candidates = [];
+  if (process.platform === "darwin") {
+    if (browser === "auto" || browser === "comet") {
+      candidates.push({
+        kind: "comet",
+        path: "/Applications/Comet.app/Contents/MacOS/Comet",
+      });
+    }
+    if (browser === "auto" || browser === "chrome") {
+      candidates.push({
+        kind: "chrome",
+        path: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+      });
+      candidates.push({
+        kind: "chrome",
+        path: "/Applications/Chromium.app/Contents/MacOS/Chromium",
+      });
+    }
+  } else {
+    if (browser === "auto" || browser === "comet") {
+      candidates.push({ kind: "comet", path: "comet" });
+      candidates.push({ kind: "comet", path: "Comet" });
+    }
+    if (browser === "auto" || browser === "chrome") {
+      candidates.push({ kind: "chrome", path: "google-chrome" });
+      candidates.push({ kind: "chrome", path: "chromium" });
+      candidates.push({ kind: "chrome", path: "chromium-browser" });
+    }
+  }
+
+  for (const candidate of candidates) {
+    const resolved = resolveExecutable(candidate.path);
+    if (resolved) {
+      return { kind: candidate.kind, executable: resolved };
+    }
+  }
+
+  return {
+    kind: browser,
+    executable: "",
+    reason: `No ${browser} browser executable was found. Checked: ${candidates
+      .map((candidate) => candidate.path)
+      .join(", ")}`,
+  };
+}
+
+function resolveExecutable(commandOrPath) {
+  if (commandOrPath.includes("/") && existsSync(commandOrPath)) {
+    return commandOrPath;
+  }
+  const pathEntries = (process.env.PATH || "").split(":").filter(Boolean);
+  for (const entry of pathEntries) {
+    const fullPath = join(entry, commandOrPath);
+    if (existsSync(fullPath)) return fullPath;
+  }
+  return "";
+}
+
+async function waitForCdp(endpoint, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  let last;
+  while (Date.now() < deadline) {
+    last = await probeCdp(endpoint);
+    if (last.ok) return last;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  return last || { ok: false };
+}
+
+async function probeCdp(endpoint) {
+  try {
+    const response = await fetch(`${endpoint.replace(/\/$/, "")}/json/version`);
+    if (!response.ok) {
+      return { ok: false, status: response.status };
+    }
+    return { ok: true, version: await response.json() };
+  } catch (error) {
+    return { ok: false, error: error.message };
   }
 }
 
