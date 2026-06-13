@@ -5,7 +5,7 @@ description: Use when the user asks Codex to consult ChatGPT Pro, GPT-5.5 Pro, t
 
 # Ask ChatGPT Pro
 
-Use the `ask_chatgpt_pro` MCP tool when the user explicitly asks for ChatGPT Pro, GPT-5.5 Pro, the chatgpt.com Pro mode, or a Pro-mode second opinion.
+Use the ChatGPT Pro MCP tools when the user explicitly asks for ChatGPT Pro, GPT-5.5 Pro, the chatgpt.com Pro mode, or a Pro-mode second opinion. Choose the synchronous or background tool yourself from the shape of the task; do not require the user to know tool names such as "async job" or "poll".
 
 Before calling `ask_chatgpt_pro`, make sure the user has a Chrome, Comet, or other Chromium-based browser instance running with remote debugging enabled and already logged into `https://chatgpt.com`.
 
@@ -58,9 +58,10 @@ When using the tool:
 - Use `mode_selection_strategy: "skip"` only after the user confirms they manually selected Pro in the browser.
 - Keep `long_prompt_strategy: "chunk"` for large diffs or logs unless the user explicitly wants fail-fast behavior.
 - Include enough context in the prompt because the web conversation is separate from the Codex thread.
-- For requests that may take many minutes, especially GPT-5.5 Pro/Pro extension analysis, prefer `start_chatgpt_pro_job` instead of blocking the Codex turn with `ask_chatgpt_pro`. Save the returned `job_id`, poll `chatgpt_pro_job_status`, and use `read_chatgpt_pro_job_result` for partial or final text.
+- Prefer `ask_chatgpt_pro` for short, focused questions where the answer should reasonably complete inside the current Codex turn.
+- Prefer `start_chatgpt_pro_job` when the task shape implies a long Pro run: large pasted context, repo-wide or multi-file review, architectural/design critique, open-ended research synthesis, deep second-opinion review, long logs, or any request where waiting in the main Codex turn would be poor UX. This is a judgment call based on work size and expected latency, not a strict keyword rule. Save the returned `job_id`, poll `chatgpt_pro_job_status`, and use `read_chatgpt_pro_job_result` for partial or final text.
 - Do not start a second Pro job on the same CDP endpoint while one is active. If `start_chatgpt_pro_job` reports an active job, poll or cancel that job first.
-- If the user asks for progress while a Pro job is running, call `chatgpt_pro_job_status`; if they ask for available text, call `read_chatgpt_pro_job_result`.
+- If the user asks naturally about a background Pro request's progress, call `chatgpt_pro_job_status`; if they ask whether anything is available or want the answer, call `read_chatgpt_pro_job_result`; if they ask to stop or abandon it, call `cancel_chatgpt_pro_job`.
 - If `ask_chatgpt_pro` returns `answer_status: "streaming"` or `answer_status: "timeout_partial"`, or if the Codex tool call is interrupted while ChatGPT may still be generating, do not send a follow-up "continue" prompt immediately. Call `read_chatgpt_pro_response` to wait for and read the latest assistant response without submitting new text. `read_chatgpt_pro_response` is read-only; it will not create a missing ChatGPT tab or navigate to a saved session URL, so use the current open ChatGPT tab or ask the user to open the saved session URL first.
 - Treat the returned answer as a second opinion, not as an authoritative source for current facts unless it cites verifiable sources.
 - Do not kill the running MCP server process from the same Codex thread to force a plugin reload. If plugin code was upgraded, ask the user to start a new Codex thread or reinstall/upgrade the plugin outside the active tool call path.

@@ -175,7 +175,7 @@ const tools = [
   {
     name: "ask_chatgpt_pro",
     description:
-      "Ask ChatGPT web Pro mode through a user-owned browser session connected over CDP.",
+      "Ask ChatGPT web Pro mode synchronously through a user-owned browser session. Best for short requests expected to finish in the current Codex turn.",
     inputSchema: {
       type: "object",
       properties: {
@@ -249,7 +249,7 @@ const tools = [
   {
     name: "start_chatgpt_pro_job",
     description:
-      "Start a long-running ChatGPT Pro request in a detached worker and return a persistent job id immediately.",
+      "Start a long-running ChatGPT Pro request in a detached worker and return immediately. Prefer this for large-context, repo-wide, deep-review, or otherwise many-minute Pro work; the user does not need to ask for an async job explicitly.",
     inputSchema: {
       type: "object",
       properties: {
