@@ -49,7 +49,14 @@ const tools = [
         profile_dir: {
           type: "string",
           description:
-            "Optional browser user-data-dir. Defaults to a dedicated pro-plugin cache profile.",
+            "Optional browser user-data-dir. Overrides profile_mode.",
+        },
+        profile_mode: {
+          type: "string",
+          enum: ["default", "dedicated"],
+          default: "default",
+          description:
+            "Use the existing browser profile when possible, or a dedicated pro-plugin profile. Default is default for smoother UX.",
         },
         open_url: {
           type: "string",
@@ -269,15 +276,9 @@ async function setupBrowser(args) {
     );
   }
 
-  const profileDir =
-    args.profile_dir ||
-    join(
-      homedir(),
-      ".cache",
-      selection.kind === "comet"
-        ? "codex-chatgpt-pro-comet-profile"
-        : "codex-chatgpt-pro-browser-profile",
-    );
+  const profileMode = args.profile_mode || "default";
+  const profile = resolveProfileDir(selection.kind, profileMode, args.profile_dir);
+  const profileDir = profile.path;
   await mkdir(profileDir, { recursive: true });
 
   const launchArgs = [
@@ -300,6 +301,12 @@ async function setupBrowser(args) {
       browser: selection.kind,
       executable: selection.executable,
       profile_dir: profileDir,
+      profile_mode: profile.mode,
+      profile_note: profile.note,
+      security_note:
+        profile.mode === "default"
+          ? "Default profile mode reuses your logged-in browser profile. Keep the CDP port bound to localhost and close this browser when finished."
+          : "Dedicated profile mode isolates this workflow but may require separate onboarding and login.",
       pid: child.pid,
       cdp_ready: ready.ok,
       browser_version: ready.version?.Browser || ready.version || null,
@@ -987,6 +994,94 @@ function resolveExecutable(commandOrPath) {
     if (existsSync(fullPath)) return fullPath;
   }
   return "";
+}
+
+function resolveProfileDir(kind, mode, explicitPath) {
+  if (explicitPath) {
+    return {
+      mode: "explicit",
+      path: explicitPath,
+      note: "Using explicit profile_dir from tool arguments.",
+    };
+  }
+
+  if (mode === "default") {
+    const defaultPath = findDefaultProfileDir(kind);
+    if (defaultPath) {
+      return {
+        mode: "default",
+        path: defaultPath,
+        note: "Using an existing browser profile so ChatGPT login/onboarding is reused.",
+      };
+    }
+  }
+
+  return {
+    mode: "dedicated",
+    path: join(
+      homedir(),
+      ".cache",
+      kind === "comet"
+        ? "codex-chatgpt-pro-comet-profile"
+        : "codex-chatgpt-pro-browser-profile",
+    ),
+    note:
+      mode === "default"
+        ? "Could not find an existing browser profile, so a dedicated pro-plugin profile is used."
+        : "Using a dedicated pro-plugin browser profile.",
+  };
+}
+
+function findDefaultProfileDir(kind) {
+  const home = homedir();
+  const candidates = [];
+
+  if (process.platform === "darwin") {
+    if (kind === "comet") {
+      candidates.push(
+        join(home, "Library", "Application Support", "Comet"),
+        join(home, "Library", "Application Support", "Perplexity", "Comet"),
+        join(home, "Library", "Application Support", "Perplexity Comet"),
+        join(home, "Library", "Application Support", "com.perplexity.comet"),
+      );
+    }
+    if (kind === "chrome" || kind === "custom") {
+      candidates.push(
+        join(home, "Library", "Application Support", "Google", "Chrome"),
+        join(home, "Library", "Application Support", "Chromium"),
+      );
+    }
+  } else if (process.platform === "win32") {
+    const localAppData = process.env.LOCALAPPDATA || join(home, "AppData", "Local");
+    if (kind === "comet") {
+      candidates.push(
+        join(localAppData, "Comet", "User Data"),
+        join(localAppData, "Perplexity", "Comet", "User Data"),
+      );
+    }
+    if (kind === "chrome" || kind === "custom") {
+      candidates.push(
+        join(localAppData, "Google", "Chrome", "User Data"),
+        join(localAppData, "Chromium", "User Data"),
+      );
+    }
+  } else {
+    if (kind === "comet") {
+      candidates.push(
+        join(home, ".config", "Comet"),
+        join(home, ".config", "comet"),
+        join(home, ".config", "perplexity-comet"),
+      );
+    }
+    if (kind === "chrome" || kind === "custom") {
+      candidates.push(
+        join(home, ".config", "google-chrome"),
+        join(home, ".config", "chromium"),
+      );
+    }
+  }
+
+  return candidates.find((candidate) => existsSync(candidate)) || "";
 }
 
 async function waitForCdp(endpoint, timeoutMs) {

@@ -9,7 +9,7 @@ Use the `ask_chatgpt_pro` MCP tool when the user explicitly asks for ChatGPT Pro
 
 Before calling `ask_chatgpt_pro`, make sure the user has a Chrome, Comet, or other Chromium-based browser instance running with remote debugging enabled and already logged into `https://chatgpt.com`.
 
-If the user asks to set up the browser, connect ChatGPT Pro, prepare Comet, or otherwise wants the setup handled inside Codex, call `setup_chatgpt_pro_browser` first. After it launches the browser, tell the user to complete ChatGPT login and 2FA in that browser window, then call `chatgpt_pro_status`.
+If the user asks to set up the browser, connect ChatGPT Pro, prepare Comet, or otherwise wants the setup handled inside Codex, call `setup_chatgpt_pro_browser` first. Use the default profile mode unless the user asks for an isolated profile; the default mode tries to reuse the user's existing Comet/Chrome profile so onboarding and ChatGPT login carry over. After it launches the browser, tell the user to complete ChatGPT login and 2FA in that browser window if prompted, then call `chatgpt_pro_status`.
 
 Default local endpoint:
 

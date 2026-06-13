@@ -18,11 +18,11 @@ In a Codex thread, ask:
 ChatGPT Pro browser setup을 해줘.
 ```
 
-Codex should call `setup_chatgpt_pro_browser`, which starts Comet or Chrome with CDP enabled and opens ChatGPT. Complete login and 2FA manually in the browser window, then ask Codex to check status.
+Codex should call `setup_chatgpt_pro_browser`, which starts Comet or Chrome with CDP enabled and opens ChatGPT. By default it tries to reuse your existing browser profile so ChatGPT login and Comet onboarding are preserved. Complete login and 2FA manually in the browser window if prompted, then ask Codex to check status.
 
 ## Manual browser session
 
-Use a dedicated profile so remote debugging is scoped to this workflow:
+To use a separate profile so remote debugging is scoped to this workflow:
 
 ```bash
 google-chrome --remote-debugging-port=9222 --user-data-dir="$HOME/.cache/codex-chatgpt-pro-profile"
@@ -47,6 +47,8 @@ Or start Comet directly with a dedicated debugging profile and the same port:
 ```
 
 If the executable path differs, inspect the app bundle or start Comet from a terminal with the equivalent `--remote-debugging-port=9222` and `--user-data-dir=...` flags.
+
+If you prefer the isolated profile from inside Codex, ask Codex to call setup with `profile_mode: "dedicated"`. The smoother default is `profile_mode: "default"`, which reuses the existing Comet or Chrome profile when the plugin can find it.
 
 ### Remote Codex Sessions
 
