@@ -20,6 +20,14 @@ ChatGPT Pro browser setup을 해줘.
 
 Codex should call `setup_chatgpt_pro_browser`, which starts Comet or Chrome with CDP enabled and opens ChatGPT. By default it tries to reuse your existing browser profile so ChatGPT login and Comet onboarding are preserved. Complete login and 2FA manually in the browser window if prompted, then ask Codex to check status.
 
+If Comet is already running with your normal profile, Chromium may reuse the existing process and ignore newly supplied CDP flags. In that case, ask Codex:
+
+```text
+Comet 기본 프로필로 ChatGPT Pro CDP LaunchAgent 설치해줘.
+```
+
+Codex should call `install_comet_cdp_launchagent`. This installs a per-user macOS LaunchAgent that starts Comet with `--remote-debugging-port=9222` using your existing Comet profile. You may need to quit and reopen Comet once after installation; future launches should keep the normal profile and expose CDP.
+
 ## Manual browser session
 
 To use a separate profile so remote debugging is scoped to this workflow:
@@ -50,6 +58,18 @@ If the executable path differs, inspect the app bundle or start Comet from a ter
 
 If you prefer the isolated profile from inside Codex, ask Codex to call setup with `profile_mode: "dedicated"`. The smoother default is `profile_mode: "default"`, which reuses the existing Comet or Chrome profile when the plugin can find it.
 
+The dedicated profile is useful as an immediate fallback, but it will have separate Comet onboarding and ChatGPT login state.
+
+### macOS Comet LaunchAgent
+
+The plugin can install this from inside Codex through `install_comet_cdp_launchagent`. It writes:
+
+```text
+~/Library/LaunchAgents/com.codex.pro-plugin.comet-cdp.plist
+```
+
+The LaunchAgent uses your existing Comet profile and keeps CDP bound to `127.0.0.1`. If Comet was already open before installation, quit and reopen Comet once. Chromium cannot enable remote debugging on an already-running browser profile.
+
 ### Remote Codex Sessions
 
 The plugin runs where Codex runs. If Codex is connected to a remote Linux host over SSH but Comet is running on your laptop or desktop, `127.0.0.1:9222` on the remote host will not see your local browser. Use an SSH reverse tunnel:
@@ -70,6 +90,7 @@ Do not expose the debugging port to an untrusted network. CDP can control the br
 
 - `setup_chatgpt_pro_browser`: starts or verifies a local Comet/Chrome CDP browser and opens ChatGPT.
 - `chatgpt_pro_status`: checks CDP reachability, SSH/tunnel hints, ChatGPT tab visibility, login/composer state, and visible model hints.
+- `install_comet_cdp_launchagent`: installs a macOS per-user LaunchAgent so Comet starts with CDP enabled while reusing the existing profile.
 - `ask_chatgpt_pro`: opens ChatGPT, tries to select Pro mode, submits a prompt, waits for the answer to stabilize, and returns the final text.
 
 Useful `ask_chatgpt_pro` options:
@@ -89,3 +110,5 @@ Recommended result format in Codex:
 ## Notes
 
 This is a browser automation bridge, not a native Codex model provider. It is intentionally heuristic because chatgpt.com UI labels and DOM structure can change.
+
+Do not kill the active MCP server process from the same Codex thread to force plugin reloads; that can close the tool transport. Upgrade or reinstall the plugin, then start a new Codex thread.

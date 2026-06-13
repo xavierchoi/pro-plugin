@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { createInterface } from "node:readline";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -84,6 +84,50 @@ const tools = [
           default: true,
           description:
             "When true, inspect ChatGPT tabs for composer and Pro-mode hints.",
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "install_comet_cdp_launchagent",
+    description:
+      "Install a macOS LaunchAgent that starts Comet with CDP enabled using the existing Comet profile.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        cdp_port: {
+          type: "integer",
+          minimum: 1024,
+          maximum: 65535,
+          default: DEFAULT_CDP_PORT,
+          description: "Local CDP port to use.",
+        },
+        executable_path: {
+          type: "string",
+          description:
+            "Optional explicit Comet executable path. Defaults to /Applications/Comet.app/Contents/MacOS/Comet.",
+        },
+        profile_dir: {
+          type: "string",
+          description:
+            "Optional Comet user-data-dir. Defaults to the detected existing Comet profile.",
+        },
+        open_url: {
+          type: "string",
+          default: CHATGPT_URL,
+          description: "URL to open when LaunchAgent starts Comet.",
+        },
+        label: {
+          type: "string",
+          default: "com.codex.pro-plugin.comet-cdp",
+          description: "LaunchAgent label.",
+        },
+        load_now: {
+          type: "boolean",
+          default: true,
+          description:
+            "When true, register and kickstart the LaunchAgent immediately. Existing Comet windows may need to be quit once first.",
         },
       },
       additionalProperties: false,
@@ -216,6 +260,9 @@ async function dispatch(method, params) {
     if (name === "chatgpt_pro_status") {
       return textResult(await status(args));
     }
+    if (name === "install_comet_cdp_launchagent") {
+      return textResult(await installCometLaunchAgent(args));
+    }
     if (name === "ask_chatgpt_pro") {
       return textResult(await askChatGptPro(args));
     }
@@ -310,21 +357,140 @@ async function setupBrowser(args) {
       pid: child.pid,
       cdp_ready: ready.ok,
       browser_version: ready.version?.Browser || ready.version || null,
-      next_steps: ready.ok
+      next_steps: browserSetupNextSteps(ready.ok, profile.mode, endpoint, selection.kind),
+    },
+    null,
+    2,
+  );
+}
+
+async function installCometLaunchAgent(args) {
+  const port = Number(args.cdp_port || DEFAULT_CDP_PORT);
+  const endpoint = `http://127.0.0.1:${port}`;
+  const label = args.label || "com.codex.pro-plugin.comet-cdp";
+  const openUrl = args.open_url || CHATGPT_URL;
+
+  if (process.platform !== "darwin") {
+    return JSON.stringify(
+      {
+        ok: false,
+        platform: process.platform,
+        next_steps: [
+          "install_comet_cdp_launchagent is only available on macOS.",
+          "Use setup_chatgpt_pro_browser or start a Chromium browser manually with --remote-debugging-port.",
+        ],
+      },
+      null,
+      2,
+    );
+  }
+
+  const existing = await probeCdp(endpoint);
+  const selection = selectBrowserExecutable("comet", args.executable_path);
+  if (!selection.executable) {
+    return JSON.stringify(
+      {
+        ok: false,
+        endpoint,
+        checks: [
+          {
+            name: "comet_executable",
+            ok: false,
+            detail: selection.reason,
+          },
+        ],
+        next_steps: [
+          "Install Comet or pass executable_path to install_comet_cdp_launchagent.",
+          "On macOS Comet is usually /Applications/Comet.app/Contents/MacOS/Comet.",
+        ],
+      },
+      null,
+      2,
+    );
+  }
+
+  const profile = resolveProfileDir("comet", "default", args.profile_dir);
+  await mkdir(profile.path, { recursive: true });
+  const launchAgentsDir = join(homedir(), "Library", "LaunchAgents");
+  await mkdir(launchAgentsDir, { recursive: true });
+  const plistPath = join(launchAgentsDir, `${label}.plist`);
+  const launchArgs = [
+    selection.executable,
+    `--remote-debugging-port=${port}`,
+    `--user-data-dir=${profile.path}`,
+    openUrl,
+  ];
+
+  await writeFile(plistPath, launchAgentPlist(label, launchArgs), "utf8");
+
+  const loadResults = [];
+  if (args.load_now !== false) {
+    const domain = `gui/${process.getuid?.()}`;
+    loadResults.push(runLaunchctl(["bootout", domain, plistPath]));
+    loadResults.push(runLaunchctl(["bootstrap", domain, plistPath]));
+    loadResults.push(runLaunchctl(["kickstart", "-k", `${domain}/${label}`]));
+  }
+
+  const after = await waitForCdp(endpoint, args.load_now === false ? 500 : 4000);
+  const hadCdp = existing.ok;
+  const hasCdp = after.ok;
+
+  return JSON.stringify(
+    {
+      ok: true,
+      endpoint,
+      cdp_ready: hasCdp,
+      already_had_cdp: hadCdp,
+      plist_path: plistPath,
+      label,
+      executable: selection.executable,
+      profile_dir: profile.path,
+      profile_note: profile.note,
+      launchctl: loadResults,
+      security_note:
+        "This enables localhost-only CDP for Comet launched by this macOS user. CDP can control logged-in browser pages, so do not expose the port to a network.",
+      next_steps: hasCdp
         ? [
-            "Complete ChatGPT login and 2FA manually in the opened browser window if prompted.",
+            "Open or focus https://chatgpt.com in Comet.",
+            "Complete ChatGPT login and 2FA manually if prompted.",
             "Run chatgpt_pro_status to verify composer and Pro mode visibility.",
-            "Then ask ChatGPT Pro from Codex.",
           ]
         : [
-            "The browser process was started but CDP did not respond within 10 seconds.",
-            "Check whether the browser blocked remote-debugging flags or whether another instance is reusing the profile.",
-            `Try opening ${endpoint}/json/version manually.`,
+            "LaunchAgent was installed, but CDP is not reachable yet.",
+            "If Comet was already running, Chromium reused that existing process and ignored the new remote-debugging flags.",
+            "Quit Comet once from the UI, then open Comet again or log out/in. Future launches should use your existing profile with CDP enabled.",
+            `After reopening, run chatgpt_pro_status against ${endpoint}.`,
           ],
     },
     null,
     2,
   );
+}
+
+function browserSetupNextSteps(ready, profileMode, endpoint, browserKind) {
+  if (ready) {
+    return [
+      "Complete ChatGPT login and 2FA manually in the opened browser window if prompted.",
+      "Run chatgpt_pro_status to verify composer and Pro mode visibility.",
+      "Then ask ChatGPT Pro from Codex.",
+    ];
+  }
+
+  if (profileMode === "default" && process.platform === "darwin" && browserKind === "comet") {
+    return [
+      "The browser process was started, but CDP did not respond within 10 seconds.",
+      "This usually means Comet was already running with this profile; Chromium cannot enable remote debugging on an already-running profile.",
+      "Call install_comet_cdp_launchagent to make future default-profile Comet launches CDP-enabled from inside Codex.",
+      "For immediate use, either quit and reopen Comet once after installing the LaunchAgent, or use profile_mode=dedicated.",
+      `You can also check ${endpoint}/json/version manually.`,
+    ];
+  }
+
+  return [
+    "The browser process was started but CDP did not respond within 10 seconds.",
+    "Check whether the browser blocked remote-debugging flags or whether another instance is reusing the profile.",
+    `Try opening ${endpoint}/json/version manually.`,
+  ];
 }
 
 async function status(args) {
@@ -352,7 +518,12 @@ async function status(args) {
     });
 
     const { browser } = connection;
-    const version = await browser.version().catch(() => "");
+    let version = "";
+    try {
+      version = browser.version();
+    } catch {
+      version = "";
+    }
     const pages = browser.contexts().flatMap((context) => context.pages());
     const chatgptPages = pages
       .filter((page) => page.url().includes("chatgpt.com"));
@@ -885,6 +1056,58 @@ function extractModelHints(text) {
     hints.add(match[0].trim());
   }
   return Array.from(hints).slice(0, 12);
+}
+
+function launchAgentPlist(label, programArguments) {
+  const argumentXml = programArguments
+    .map((argument) => `    <string>${xmlEscape(argument)}</string>`)
+    .join("\n");
+  const logPath = join(homedir(), "Library", "Logs", `${label}.log`);
+
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${xmlEscape(label)}</string>
+  <key>ProgramArguments</key>
+  <array>
+${argumentXml}
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <false/>
+  <key>StandardOutPath</key>
+  <string>${xmlEscape(logPath)}</string>
+  <key>StandardErrorPath</key>
+  <string>${xmlEscape(logPath)}</string>
+</dict>
+</plist>
+`;
+}
+
+function xmlEscape(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&apos;");
+}
+
+function runLaunchctl(args) {
+  const result = spawnSync("launchctl", args, {
+    encoding: "utf8",
+  });
+  return {
+    command: `launchctl ${args.join(" ")}`,
+    status: result.status,
+    signal: result.signal,
+    stdout: (result.stdout || "").trim(),
+    stderr: (result.stderr || "").trim(),
+    ok: result.status === 0,
+  };
 }
 
 function normalizeSessionName(name) {
