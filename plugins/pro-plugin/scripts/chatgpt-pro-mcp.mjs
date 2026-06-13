@@ -751,7 +751,7 @@ async function askChatGptPro(args) {
     const proSelection = await selectProMode(page, args.target_model || "GPT-5.5 Pro");
     if (!proSelection.selected && requireProMode) {
       throw new Error(
-        `Could not confidently select Pro mode: ${proSelection.reason}. Set require_pro_mode=false for a best-effort call.`,
+        `Could not confidently select Pro mode: ${proSelection.reason}. Visible candidates: ${JSON.stringify(proSelection.visible_menu_candidates || [])}. Set require_pro_mode=false for a best-effort call.`,
       );
     }
 
@@ -1010,21 +1010,13 @@ async function selectProMode(page, targetModel = "GPT-5.5 Pro") {
   };
 }
 
-const MODE_CANDIDATE_SELECTOR = [
-  '[role="menuitem"]',
-  '[role="option"]',
-  'button',
-  '[aria-label]',
-  '[data-testid*="model" i]',
-].join(", ");
-
 async function bestProModeCandidate(page, targetModel) {
   const candidates = await scoredMenuCandidates(page, targetModel);
   const match = candidates.find((candidate) => candidate.score >= 80 && candidate.has_pro);
   if (!match) return null;
   return {
     ...match,
-    locator: page.locator(MODE_CANDIDATE_SELECTOR).nth(match.index),
+    locator: page.locator(`[data-pro-plugin-mode-candidate="${match.marker}"]`).first(),
   };
 }
 
@@ -1043,7 +1035,7 @@ async function bestModelSubmenuCandidate(page, targetModel) {
   if (!match) return null;
   return {
     ...match,
-    locator: page.locator(MODE_CANDIDATE_SELECTOR).nth(match.index),
+    locator: page.locator(`[data-pro-plugin-mode-candidate="${match.marker}"]`).first(),
   };
 }
 
@@ -1053,59 +1045,97 @@ async function menuCandidateSummaries(page, targetModel) {
 }
 
 async function scoredMenuCandidates(page, targetModel) {
-  const candidates = await page.locator(MODE_CANDIDATE_SELECTOR).evaluateAll((nodes) =>
-    nodes
-      .map((node, index) => {
-        const element = node instanceof HTMLElement ? node : null;
-        if (!element) return null;
-        const rect = element.getBoundingClientRect();
-        const style = window.getComputedStyle(element);
-        const visible =
-          rect.width > 0 &&
-          rect.height > 0 &&
-          style.visibility !== "hidden" &&
-          style.display !== "none";
-        if (!visible) return null;
+  const candidates = await page.evaluate(() => {
+    const menuSelector = [
+      '[role="menu"]',
+      '[role="listbox"]',
+      '[role="dialog"]',
+      '[data-radix-popper-content-wrapper]',
+      "[data-side]",
+      "[popover]",
+    ].join(", ");
+    const clickableSelector = [
+      "button",
+      '[role="menuitem"]',
+      '[role="option"]',
+      '[role="button"]',
+      "a[href]",
+      "[tabindex]",
+      "[data-testid]",
+    ].join(", ");
 
-        const role = element.getAttribute("role") || "";
-        const inMenu = Boolean(
-          element.closest(
-            [
-              '[role="menu"]',
-              '[role="listbox"]',
-              '[role="dialog"]',
-              '[data-radix-popper-content-wrapper]',
-              "[data-side]",
-              "[popover]",
-            ].join(", "),
-          ),
-        );
-        if (!inMenu && role !== "menuitem" && role !== "option") return null;
+    function visible(element) {
+      const rect = element.getBoundingClientRect();
+      const style = window.getComputedStyle(element);
+      return (
+        rect.width > 0 &&
+        rect.height > 0 &&
+        style.visibility !== "hidden" &&
+        style.display !== "none"
+      );
+    }
 
-        const text = [
-          element.innerText,
-          element.textContent,
-          element.getAttribute("aria-label"),
-          element.getAttribute("data-testid"),
-        ]
-          .filter(Boolean)
-          .join(" ")
-          .replace(/\s+/g, " ")
-          .trim();
-        if (!text) return null;
+    function compactText(element) {
+      return [
+        element.innerText,
+        element.textContent,
+        element.getAttribute("aria-label"),
+        element.getAttribute("data-testid"),
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .replace(/\s+/g, " ")
+        .trim();
+    }
 
-        return {
-          index,
+    const menuRoots = Array.from(document.querySelectorAll(menuSelector))
+      .filter((element) => element instanceof HTMLElement && visible(element));
+    const roots = menuRoots.length > 0 ? menuRoots : [document.body];
+    const seen = new Set();
+    const results = [];
+
+    for (const root of roots) {
+      const nodes = Array.from(root.querySelectorAll("*"))
+        .filter((element) => element instanceof HTMLElement && visible(element));
+
+      for (const element of nodes) {
+        const text = compactText(element);
+        if (!text || text.length > 240) continue;
+        if (!/[Pp]ro|프로|GPT|즉시|중간|높음|Instant|Medium|High|Thinking/.test(text)) {
+          continue;
+        }
+
+        const clickable =
+          element.closest(clickableSelector) ||
+          element.parentElement?.closest(clickableSelector) ||
+          element;
+        if (!(clickable instanceof HTMLElement) || !visible(clickable)) continue;
+
+        const marker = `pro-plugin-${results.length}`;
+        clickable.setAttribute("data-pro-plugin-mode-candidate", marker);
+        const key = `${clickable.tagName}:${clickable.getAttribute("role") || ""}:${text}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+
+        results.push({
+          marker,
           text,
-          role,
+          role: clickable.getAttribute("role") || element.getAttribute("role") || "",
           checked:
+            clickable.getAttribute("aria-checked") === "true" ||
+            clickable.getAttribute("aria-selected") === "true" ||
             element.getAttribute("aria-checked") === "true" ||
             element.getAttribute("aria-selected") === "true",
-          has_popup: Boolean(element.getAttribute("aria-haspopup")),
-        };
-      })
-      .filter(Boolean),
-  );
+          has_popup: Boolean(
+            clickable.getAttribute("aria-haspopup") ||
+              element.getAttribute("aria-haspopup"),
+          ),
+        });
+      }
+    }
+
+    return results;
+  });
 
   return candidates
     .map((candidate) => scoreModeCandidate(candidate, targetModel))
