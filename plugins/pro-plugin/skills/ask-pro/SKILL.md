@@ -11,7 +11,7 @@ Before calling `ask_chatgpt_pro`, make sure the user has a Chrome, Comet, or oth
 
 If the user asks to set up the browser, connect ChatGPT Pro, prepare Comet, or otherwise wants the setup handled inside Codex, call `setup_chatgpt_pro_browser` first. Use the default profile mode unless the user asks for an isolated profile; the default mode tries to reuse the user's existing Comet/Chrome profile so onboarding and ChatGPT login carry over.
 
-If default-profile Comet launches but CDP is not ready, do not immediately switch to a dedicated profile. First call `install_comet_cdp_launchagent` so future Comet launches use the existing profile with `--remote-debugging-port`. If Comet was already running, explain that Chromium cannot add CDP to an already-running profile; the user may need to quit and reopen Comet once, or wait for the next login. Use a dedicated profile only when the user accepts separate onboarding/login or needs an immediate isolated fallback.
+If default-profile Comet launches but CDP is not ready, do not immediately switch to a dedicated profile. First call `install_comet_cdp_launchagent` so future Comet launches use the existing profile with `--remote-debugging-port`. If Comet was already running, explain that Chromium cannot add CDP to an already-running profile; the user may need to quit and reopen Comet once, or wait for the next login. If the user wants Codex to handle that restart, call `restart_comet_cdp_launchagent`, which gracefully asks macOS to quit Comet and then kickstarts the installed LaunchAgent. Use a dedicated profile only when the user accepts separate onboarding/login or needs an immediate isolated fallback.
 
 After the browser is reachable, tell the user to complete ChatGPT login and 2FA in that browser window if prompted, then call `chatgpt_pro_status`.
 
@@ -49,6 +49,7 @@ When using the tool:
 
 - Prefer `setup_chatgpt_pro_browser` over asking the user to run shell commands manually.
 - If existing-profile Comet does not expose CDP, call `install_comet_cdp_launchagent` before falling back to `profile_mode: "dedicated"`.
+- If LaunchAgent is installed but Comet still opened without CDP, use `restart_comet_cdp_launchagent` when the user has agreed that Codex may quit and reopen Comet.
 - Call `chatgpt_pro_status` before the first Pro request in a new Codex thread.
 - Prefer `conversation_mode: "new"` for isolated questions.
 - Use `session_name` with `conversation_mode: "named"` for a deliberate multi-turn Pro-mode review thread.

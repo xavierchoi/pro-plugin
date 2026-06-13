@@ -4,11 +4,9 @@ This plugin adds a local MCP tool that lets Codex ask the ChatGPT web app in Pro
 
 It does not read or store ChatGPT credentials. It connects to Chrome or Chromium through the Chrome DevTools Protocol, so you log in manually in the browser and the plugin only automates the visible web UI.
 
-## Install dependencies
+## Dependencies
 
-```bash
-npm install
-```
+The MCP server will try to install its Node dependency (`playwright-core`) automatically the first time a browser connection is checked. For local development, you can still run `npm install` manually in this plugin directory.
 
 ## Start a browser session from Codex
 
@@ -26,7 +24,7 @@ If Comet is already running with your normal profile, Chromium may reuse the exi
 Comet 기본 프로필로 ChatGPT Pro CDP LaunchAgent 설치해줘.
 ```
 
-Codex should call `install_comet_cdp_launchagent`. This installs a per-user macOS LaunchAgent that starts Comet with `--remote-debugging-port=9222` using your existing Comet profile. You may need to quit and reopen Comet once after installation; future launches should keep the normal profile and expose CDP.
+Codex should call `install_comet_cdp_launchagent`. This installs a per-user macOS LaunchAgent that starts Comet with `--remote-debugging-port=9222` using your existing Comet profile. You may need to quit and reopen Comet once after installation; future launches should keep the normal profile and expose CDP. If you want Codex to perform the restart, ask it to restart Comet through the installed LaunchAgent.
 
 ## Manual browser session
 
@@ -70,6 +68,8 @@ The plugin can install this from inside Codex through `install_comet_cdp_launcha
 
 The LaunchAgent uses your existing Comet profile and keeps CDP bound to `127.0.0.1`. If Comet was already open before installation, quit and reopen Comet once. Chromium cannot enable remote debugging on an already-running browser profile.
 
+Codex can also call `restart_comet_cdp_launchagent` after the LaunchAgent is installed. That tool asks macOS to quit Comet gracefully and then kickstarts the LaunchAgent, which is useful when reopening Comet from the Dock still starts the normal app path.
+
 ### Remote Codex Sessions
 
 The plugin runs where Codex runs. If Codex is connected to a remote Linux host over SSH but Comet is running on your laptop or desktop, `127.0.0.1:9222` on the remote host will not see your local browser. Use an SSH reverse tunnel:
@@ -91,6 +91,7 @@ Do not expose the debugging port to an untrusted network. CDP can control the br
 - `setup_chatgpt_pro_browser`: starts or verifies a local Comet/Chrome CDP browser and opens ChatGPT.
 - `chatgpt_pro_status`: checks CDP reachability, SSH/tunnel hints, ChatGPT tab visibility, login/composer state, and visible model hints.
 - `install_comet_cdp_launchagent`: installs a macOS per-user LaunchAgent so Comet starts with CDP enabled while reusing the existing profile.
+- `restart_comet_cdp_launchagent`: gracefully quits Comet and kickstarts the installed LaunchAgent so Comet reopens with CDP enabled.
 - `ask_chatgpt_pro`: opens ChatGPT, tries to select Pro mode, submits a prompt, waits for the answer to stabilize, and returns the final text.
 
 Useful `ask_chatgpt_pro` options:

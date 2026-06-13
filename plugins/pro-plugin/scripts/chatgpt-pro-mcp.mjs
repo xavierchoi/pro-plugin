@@ -6,6 +6,7 @@ import { existsSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const DEFAULT_CDP_ENDPOINT =
   process.env.CHATGPT_PRO_CDP_ENDPOINT || "http://127.0.0.1:9222";
@@ -18,6 +19,8 @@ const SESSION_STORE_PATH =
   process.env.CHATGPT_PRO_SESSION_STORE ||
   join(homedir(), ".cache", "pro-plugin", "sessions.json");
 const DEFAULT_CDP_PORT = Number(process.env.CHATGPT_PRO_CDP_PORT || 9222);
+const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
+const PLUGIN_DIR = dirname(SCRIPT_DIR);
 
 const tools = [
   {
@@ -128,6 +131,36 @@ const tools = [
           default: true,
           description:
             "When true, register and kickstart the LaunchAgent immediately. Existing Comet windows may need to be quit once first.",
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "restart_comet_cdp_launchagent",
+    description:
+      "Gracefully quit Comet and kickstart the installed CDP LaunchAgent so Comet reopens with remote debugging enabled.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        cdp_port: {
+          type: "integer",
+          minimum: 1024,
+          maximum: 65535,
+          default: DEFAULT_CDP_PORT,
+          description: "Local CDP port to verify after restart.",
+        },
+        label: {
+          type: "string",
+          default: "com.codex.pro-plugin.comet-cdp",
+          description: "LaunchAgent label.",
+        },
+        wait_ms: {
+          type: "integer",
+          minimum: 1000,
+          maximum: 60000,
+          default: 15000,
+          description: "How long to wait for CDP after kickstarting Comet.",
         },
       },
       additionalProperties: false,
@@ -262,6 +295,9 @@ async function dispatch(method, params) {
     }
     if (name === "install_comet_cdp_launchagent") {
       return textResult(await installCometLaunchAgent(args));
+    }
+    if (name === "restart_comet_cdp_launchagent") {
+      return textResult(await restartCometLaunchAgent(args));
     }
     if (name === "ask_chatgpt_pro") {
       return textResult(await askChatGptPro(args));
@@ -467,6 +503,79 @@ async function installCometLaunchAgent(args) {
   );
 }
 
+async function restartCometLaunchAgent(args) {
+  const port = Number(args.cdp_port || DEFAULT_CDP_PORT);
+  const endpoint = `http://127.0.0.1:${port}`;
+  const label = args.label || "com.codex.pro-plugin.comet-cdp";
+  const waitMs = Number(args.wait_ms || 15000);
+
+  if (process.platform !== "darwin") {
+    return JSON.stringify(
+      {
+        ok: false,
+        platform: process.platform,
+        next_steps: [
+          "restart_comet_cdp_launchagent is only available on macOS.",
+        ],
+      },
+      null,
+      2,
+    );
+  }
+
+  const plistPath = join(homedir(), "Library", "LaunchAgents", `${label}.plist`);
+  if (!existsSync(plistPath)) {
+    return JSON.stringify(
+      {
+        ok: false,
+        endpoint,
+        plist_path: plistPath,
+        next_steps: [
+          "LaunchAgent is not installed yet.",
+          "Run install_comet_cdp_launchagent first.",
+        ],
+      },
+      null,
+      2,
+    );
+  }
+
+  const domain = `gui/${process.getuid?.()}`;
+  const quit = runCommand("osascript", ["-e", 'tell application "Comet" to quit']);
+  await sleep(3000);
+  const print = runLaunchctl(["print", `${domain}/${label}`]);
+  const bootstrap = print.ok ? null : runLaunchctl(["bootstrap", domain, plistPath]);
+  const kickstart = runLaunchctl(["kickstart", "-k", `${domain}/${label}`]);
+  const ready = await waitForCdp(endpoint, waitMs);
+
+  return JSON.stringify(
+    {
+      ok: ready.ok,
+      endpoint,
+      cdp_ready: ready.ok,
+      browser_version: ready.version?.Browser || ready.version || null,
+      plist_path: plistPath,
+      osascript: quit,
+      launchctl: {
+        print,
+        bootstrap,
+        kickstart,
+      },
+      next_steps: ready.ok
+        ? [
+            "Run chatgpt_pro_status to verify ChatGPT login and Pro mode visibility.",
+          ]
+        : [
+            "Comet was asked to quit and the LaunchAgent was kickstarted, but CDP is still not reachable.",
+            "Check whether Comet is still running without --remote-debugging-port or whether macOS blocked relaunch.",
+            `Try opening ${endpoint}/json/version manually after Comet is visible.`,
+          ],
+    },
+    null,
+    2,
+  );
+}
+
 function browserSetupNextSteps(ready, profileMode, endpoint, browserKind) {
   if (ready) {
     return [
@@ -511,6 +620,13 @@ async function status(args) {
   let connection;
   try {
     connection = await connectBrowser(endpoint);
+    if (connection.dependency?.installed) {
+      diagnostics.checks.push({
+        name: "dependency_install",
+        ok: true,
+        detail: "Installed playwright-core automatically in the pro-plugin directory.",
+      });
+    }
     diagnostics.checks.push({
       name: "cdp_endpoint",
       ok: true,
@@ -682,19 +798,13 @@ async function askChatGptPro(args) {
 }
 
 async function connectBrowser(endpoint = DEFAULT_CDP_ENDPOINT) {
-  let playwright;
-  try {
-    playwright = await import("playwright-core");
-  } catch {
-    throw new Error(
-      "Missing dependency: run `npm install` in the pro-plugin directory so playwright-core is available.",
-    );
-  }
+  const dependency = await loadPlaywrightCore();
 
   try {
-    const browser = await playwright.chromium.connectOverCDP(endpoint);
+    const browser = await dependency.playwright.chromium.connectOverCDP(endpoint);
     return {
       browser,
+      dependency,
       close: async () => {
         await browser.close().catch(() => {});
       },
@@ -703,6 +813,44 @@ async function connectBrowser(endpoint = DEFAULT_CDP_ENDPOINT) {
     throw new Error(
       `Could not connect to Chromium CDP endpoint ${endpoint}: ${error.message}. Start Chrome or Comet with --remote-debugging-port=9222. If Codex is remote and the browser is local, connect with ssh -R 9222:127.0.0.1:9222 <remote-codex-host>.`,
     );
+  }
+}
+
+async function loadPlaywrightCore() {
+  try {
+    return {
+      playwright: await import("playwright-core"),
+      installed: false,
+    };
+  } catch (firstError) {
+    const packageJson = join(PLUGIN_DIR, "package.json");
+    if (!existsSync(packageJson)) {
+      throw new Error(
+        `Missing dependency playwright-core and package.json was not found at ${packageJson}: ${firstError.message}`,
+      );
+    }
+
+    const npm = process.platform === "win32" ? "npm.cmd" : "npm";
+    const install = runCommand(npm, ["install", "--omit=dev"], {
+      cwd: PLUGIN_DIR,
+      timeout: 120000,
+    });
+    if (!install.ok) {
+      throw new Error(
+        `Missing dependency playwright-core and automatic npm install failed in ${PLUGIN_DIR}: ${install.stderr || install.stdout || `exit ${install.status}`}`,
+      );
+    }
+
+    try {
+      return {
+        playwright: await import("playwright-core"),
+        installed: true,
+      };
+    } catch (secondError) {
+      throw new Error(
+        `Installed dependencies in ${PLUGIN_DIR}, but playwright-core still could not be loaded: ${secondError.message}`,
+      );
+    }
   }
 }
 
@@ -1097,17 +1245,26 @@ function xmlEscape(value) {
 }
 
 function runLaunchctl(args) {
-  const result = spawnSync("launchctl", args, {
+  return runCommand("launchctl", args);
+}
+
+function runCommand(command, args, options = {}) {
+  const result = spawnSync(command, args, {
     encoding: "utf8",
+    ...options,
   });
   return {
-    command: `launchctl ${args.join(" ")}`,
+    command: `${command} ${args.join(" ")}`,
     status: result.status,
     signal: result.signal,
     stdout: (result.stdout || "").trim(),
     stderr: (result.stderr || "").trim(),
     ok: result.status === 0,
   };
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function normalizeSessionName(name) {
