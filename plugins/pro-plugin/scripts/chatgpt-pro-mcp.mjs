@@ -1001,12 +1001,22 @@ async function chooseVisibleProMode(page, targetModel, pickerSummary) {
   if (option) {
     await option.locator.click().catch(() => {});
     await page.waitForTimeout(1000);
+    const verified = await verifyProModeSelected(page, pickerSummary);
+    if (!verified.ok) {
+      return {
+        selected: false,
+        target_model: targetModel,
+        reason: `Clicked Pro-like option but selection did not verify: ${option.text}`,
+        visible_menu_candidates: [option.summary, ...verified.candidates],
+      };
+    }
     return {
       selected: true,
       target_model: targetModel,
       reason: `Clicked Pro-like menu option: ${option.text}`,
       picker: pickerSummary,
       candidate: option.summary,
+      verification: verified.selected,
     };
   }
 
@@ -1019,6 +1029,15 @@ async function chooseVisibleProMode(page, targetModel, pickerSummary) {
     if (nestedOption) {
       await nestedOption.locator.click().catch(() => {});
       await page.waitForTimeout(1000);
+      const verified = await verifyProModeSelected(page, pickerSummary);
+      if (!verified.ok) {
+        return {
+          selected: false,
+          target_model: targetModel,
+          reason: `Clicked nested Pro-like option but selection did not verify: ${nestedOption.text}`,
+          visible_menu_candidates: [nestedOption.summary, ...verified.candidates],
+        };
+      }
       return {
         selected: true,
         target_model: targetModel,
@@ -1026,6 +1045,7 @@ async function chooseVisibleProMode(page, targetModel, pickerSummary) {
         picker: pickerSummary,
         submenu: submenu.summary,
         candidate: nestedOption.summary,
+        verification: verified.selected,
       };
     }
     attempts.push(...(await menuCandidateSummaries(page, targetModel)));
@@ -1036,6 +1056,77 @@ async function chooseVisibleProMode(page, targetModel, pickerSummary) {
     target_model: targetModel,
     reason: "No visible Pro-like menu option was found.",
     visible_menu_candidates: attempts,
+  };
+}
+
+async function verifyProModeSelected(page, pickerSummary) {
+  if (!pickerSummary) {
+    return { ok: false, selected: null, candidates: [] };
+  }
+
+  const visibleHints = await visibleModelHints(page);
+  const selectedHint = visibleHints.find((hint) => /\bPro\b/i.test(hint) || /프로/.test(hint));
+  if (selectedHint) {
+    return {
+      ok: true,
+      selected: { text: selectedHint, source: "composer-visible-hint" },
+      candidates: [],
+    };
+  }
+
+  let opened = false;
+  if (pickerSummary.source === "fixed-selector") {
+    const locator = page.locator(pickerSummary.text).first();
+    if (await isVisible(locator, 800)) {
+      await locator.click().catch(() => {});
+      opened = true;
+    }
+  } else if (pickerSummary.marker) {
+    const locator = page.locator(`[data-pro-plugin-picker-candidate="${pickerSummary.marker}"]`).first();
+    if (await isVisible(locator, 800)) {
+      await locator.click().catch(() => {});
+      opened = true;
+    }
+  }
+
+  if (!opened) {
+    const fallbackPickers = await pickerCandidates(page, [
+      'button:has-text("Pro")',
+      'button:has-text("프로")',
+      'button:has-text("즉시")',
+      'button:has-text("중간")',
+      'button:has-text("높음")',
+      'button:has-text("매우 높음")',
+      'button:has-text("Instant")',
+      'button:has-text("Medium")',
+      'button:has-text("High")',
+      'button:has-text("Thinking")',
+    ]);
+    for (const picker of fallbackPickers) {
+      if (picker.locator) {
+        if (!(await isVisible(picker.locator, 500))) continue;
+        await picker.locator.click().catch(() => {});
+        opened = true;
+        break;
+      }
+      const locator = page.locator(`[data-pro-plugin-picker-candidate="${picker.marker}"]`).first();
+      if (await isVisible(locator, 500)) {
+        await locator.click().catch(() => {});
+        opened = true;
+        break;
+      }
+    }
+  }
+  await page.waitForTimeout(500);
+
+  const candidates = await scoredMenuCandidates(page, "Pro");
+  const selected = candidates.find((candidate) => candidate.checked);
+  await page.keyboard.press("Escape").catch(() => {});
+
+  return {
+    ok: Boolean(selected?.has_pro),
+    selected: selected?.summary || null,
+    candidates: candidates.slice(0, 8).map((candidate) => candidate.summary),
   };
 }
 
@@ -1273,6 +1364,7 @@ async function scoredMenuCandidates(page, targetModel) {
 
 function scoreModeCandidate(candidate, targetModel) {
   const text = normalizeText(candidate.text);
+  const signalCount = effortSignalCount(candidate.text);
   const hasPro = /\bpro\b/i.test(candidate.text) || text.includes("프로");
   const hasNonProEffort =
     /\b(?:instant|medium|high|thinking)\b/i.test(candidate.text) ||
@@ -1283,6 +1375,7 @@ function scoreModeCandidate(candidate, targetModel) {
   const targetMatched = targetTerms(targetModel).every((term) => text.includes(term));
 
   let score = 0;
+  if (signalCount >= 3) score -= 180;
   if (hasPro) score += 100;
   if (targetMatched) score += 80;
   if (hasExpansionHint) score += 20;
@@ -1301,8 +1394,27 @@ function scoreModeCandidate(candidate, targetModel) {
       role: candidate.role,
       checked: candidate.checked,
       has_popup: candidate.has_popup,
+      signal_count: signalCount,
     },
   };
+}
+
+function effortSignalCount(text) {
+  const signals = [
+    /\binstant\b/i,
+    /\bmedium\b/i,
+    /\bhigh\b/i,
+    /\bthinking\b/i,
+    /\bpro\b/i,
+    /즉시/,
+    /중간/,
+    /높음/,
+    /매우\s*높음/,
+    /프로/,
+    /확장/,
+    /GPT-?5(?:\.5)?/i,
+  ];
+  return signals.reduce((count, pattern) => count + (pattern.test(text) ? 1 : 0), 0);
 }
 
 function dedupeSummaries(summaries) {
