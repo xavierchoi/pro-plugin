@@ -54,6 +54,7 @@ When using the tool:
 - Prefer `conversation_mode: "new"` for isolated questions.
 - Use `session_name` with `conversation_mode: "named"` for a deliberate multi-turn Pro-mode review thread.
 - Use `require_pro_mode: true` unless the user says best-effort is acceptable.
+- Treat Pro as an effort/mode choice, not just a model name. The tool should open the model/effort menu and choose a high-confidence Pro-like clickable option; it should not assume that visible `Pro` text elsewhere means Pro mode is selected. If selection fails, inspect the returned `visible_menu_candidates`.
 - Keep `long_prompt_strategy: "chunk"` for large diffs or logs unless the user explicitly wants fail-fast behavior.
 - Include enough context in the prompt because the web conversation is separate from the Codex thread.
 - Treat the returned answer as a second opinion, not as an authoritative source for current facts unless it cites verifiable sources.

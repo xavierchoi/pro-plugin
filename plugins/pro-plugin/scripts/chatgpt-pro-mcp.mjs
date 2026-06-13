@@ -944,29 +944,12 @@ async function findComposer(page) {
 }
 
 async function selectProMode(page, targetModel = "GPT-5.5 Pro") {
-  const currentText = await visibleBodyText(page);
-  const targetWords = targetModel
-    .split(/\s+/)
-    .map((word) => word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
-  const targetRegex = new RegExp(targetWords.join("\\s+"), "i");
-  if (targetRegex.test(currentText)) {
-    return {
-      selected: true,
-      target_model: targetModel,
-      reason: `Visible page already mentions ${targetModel}.`,
-    };
-  }
-  if (/\bPro\b/i.test(currentText) && /GPT-?5\.5/i.test(currentText)) {
-    return {
-      selected: true,
-      target_model: targetModel,
-      reason: "Visible page already mentions GPT-5.5 and Pro.",
-    };
-  }
-
+  const attempts = [];
   const pickerSelectors = [
     '[data-testid="model-switcher-dropdown-button"]',
     '[data-testid*="model-switcher" i]',
+    'button:has-text("지능")',
+    'button[aria-haspopup="menu"]:has-text("지능")',
     'button[aria-haspopup="menu"]:has-text("GPT")',
     'button[aria-haspopup="listbox"]:has-text("GPT")',
     'button[aria-label*="model" i]',
@@ -983,26 +966,37 @@ async function selectProMode(page, targetModel = "GPT-5.5 Pro") {
     await picker.click().catch(() => {});
     await page.waitForTimeout(700);
 
-    const option = await firstVisibleLocator(page, [
-      `text=/${targetWords.join("\\\\s+")}/i`,
-      'text=/GPT-?5\\.5\\s+Pro/i',
-      'text=/GPT-?5\\.5.*Pro/i',
-      '[role="menuitem"]:has-text("GPT-5.5")',
-      '[role="option"]:has-text("GPT-5.5")',
-      'text=/\\bPro\\b/i',
-      '[role="menuitem"]:has-text("Pro")',
-      '[role="option"]:has-text("Pro")',
-      'button:has-text("Pro")',
-    ]);
-
+    const option = await bestProModeCandidate(page, targetModel);
     if (option) {
-      await option.click().catch(() => {});
+      await option.locator.click().catch(() => {});
       await page.waitForTimeout(1000);
       return {
         selected: true,
         target_model: targetModel,
-        reason: "Clicked a visible Pro option.",
+        reason: `Clicked Pro-like menu option: ${option.text}`,
+        candidate: option.summary,
       };
+    }
+
+    attempts.push(...(await menuCandidateSummaries(page, targetModel)));
+
+    const submenu = await bestModelSubmenuCandidate(page, targetModel);
+    if (submenu) {
+      await submenu.locator.click().catch(() => {});
+      await page.waitForTimeout(700);
+      const nestedOption = await bestProModeCandidate(page, targetModel);
+      if (nestedOption) {
+        await nestedOption.locator.click().catch(() => {});
+        await page.waitForTimeout(1000);
+        return {
+          selected: true,
+          target_model: targetModel,
+          reason: `Clicked Pro-like menu option after opening submenu: ${nestedOption.text}`,
+          submenu: submenu.summary,
+          candidate: nestedOption.summary,
+        };
+      }
+      attempts.push(...(await menuCandidateSummaries(page, targetModel)));
     }
 
     await page.keyboard.press("Escape").catch(() => {});
@@ -1011,9 +1005,165 @@ async function selectProMode(page, targetModel = "GPT-5.5 Pro") {
   return {
     selected: false,
     target_model: targetModel,
-    reason:
-      `No visible model picker option matching ${targetModel}, GPT-5.5 Pro, or Pro was found.`,
+    reason: `No high-confidence Pro-like option was found in the visible model/effort menu for ${targetModel}.`,
+    visible_menu_candidates: attempts.slice(0, 12),
   };
+}
+
+const MODE_CANDIDATE_SELECTOR = [
+  '[role="menuitem"]',
+  '[role="option"]',
+  'button',
+  '[aria-label]',
+  '[data-testid*="model" i]',
+].join(", ");
+
+async function bestProModeCandidate(page, targetModel) {
+  const candidates = await scoredMenuCandidates(page, targetModel);
+  const match = candidates.find((candidate) => candidate.score >= 80 && candidate.has_pro);
+  if (!match) return null;
+  return {
+    ...match,
+    locator: page.locator(MODE_CANDIDATE_SELECTOR).nth(match.index),
+  };
+}
+
+async function bestModelSubmenuCandidate(page, targetModel) {
+  const candidates = await scoredMenuCandidates(page, targetModel);
+  const targetModelStem = modelStem(targetModel);
+  const match = candidates.find((candidate) => {
+    const text = normalizeText(candidate.text);
+    return (
+      targetModelStem &&
+      text.includes(targetModelStem) &&
+      !candidate.has_pro &&
+      !candidate.has_non_pro_effort
+    );
+  });
+  if (!match) return null;
+  return {
+    ...match,
+    locator: page.locator(MODE_CANDIDATE_SELECTOR).nth(match.index),
+  };
+}
+
+async function menuCandidateSummaries(page, targetModel) {
+  const candidates = await scoredMenuCandidates(page, targetModel);
+  return candidates.slice(0, 12).map((candidate) => candidate.summary);
+}
+
+async function scoredMenuCandidates(page, targetModel) {
+  const candidates = await page.locator(MODE_CANDIDATE_SELECTOR).evaluateAll((nodes) =>
+    nodes
+      .map((node, index) => {
+        const element = node instanceof HTMLElement ? node : null;
+        if (!element) return null;
+        const rect = element.getBoundingClientRect();
+        const style = window.getComputedStyle(element);
+        const visible =
+          rect.width > 0 &&
+          rect.height > 0 &&
+          style.visibility !== "hidden" &&
+          style.display !== "none";
+        if (!visible) return null;
+
+        const role = element.getAttribute("role") || "";
+        const inMenu = Boolean(
+          element.closest(
+            [
+              '[role="menu"]',
+              '[role="listbox"]',
+              '[role="dialog"]',
+              '[data-radix-popper-content-wrapper]',
+              "[data-side]",
+              "[popover]",
+            ].join(", "),
+          ),
+        );
+        if (!inMenu && role !== "menuitem" && role !== "option") return null;
+
+        const text = [
+          element.innerText,
+          element.textContent,
+          element.getAttribute("aria-label"),
+          element.getAttribute("data-testid"),
+        ]
+          .filter(Boolean)
+          .join(" ")
+          .replace(/\s+/g, " ")
+          .trim();
+        if (!text) return null;
+
+        return {
+          index,
+          text,
+          role,
+          checked:
+            element.getAttribute("aria-checked") === "true" ||
+            element.getAttribute("aria-selected") === "true",
+          has_popup: Boolean(element.getAttribute("aria-haspopup")),
+        };
+      })
+      .filter(Boolean),
+  );
+
+  return candidates
+    .map((candidate) => scoreModeCandidate(candidate, targetModel))
+    .filter((candidate) => candidate.score > -50)
+    .sort((left, right) => right.score - left.score);
+}
+
+function scoreModeCandidate(candidate, targetModel) {
+  const text = normalizeText(candidate.text);
+  const hasPro = /\bpro\b/i.test(candidate.text) || text.includes("프로");
+  const hasNonProEffort =
+    /\b(?:instant|medium|high|thinking)\b/i.test(candidate.text) ||
+    /(?:즉시|중간|높음|매우\s*높음)/.test(candidate.text);
+  const hasExpansionHint =
+    /\b(?:extend|extension|extended|expand|expanded|basic)\b/i.test(candidate.text) ||
+    /(?:확장|기본)/.test(candidate.text);
+  const targetMatched = targetTerms(targetModel).every((term) => text.includes(term));
+
+  let score = 0;
+  if (hasPro) score += 100;
+  if (targetMatched) score += 80;
+  if (hasExpansionHint) score += 20;
+  if (candidate.checked) score += 8;
+  if (candidate.has_popup && !hasPro) score -= 5;
+  if (hasNonProEffort && !hasPro) score -= 120;
+
+  return {
+    ...candidate,
+    score,
+    has_pro: hasPro,
+    has_non_pro_effort: hasNonProEffort,
+    summary: {
+      text: candidate.text,
+      score,
+      role: candidate.role,
+      checked: candidate.checked,
+      has_popup: candidate.has_popup,
+    },
+  };
+}
+
+function targetTerms(targetModel) {
+  return normalizeText(targetModel)
+    .split(/\s+/)
+    .filter((term) => term.length > 1);
+}
+
+function modelStem(targetModel) {
+  const normalized = normalizeText(targetModel);
+  const match = normalized.match(/gpt-?\d(?:\.\d+)?/);
+  return match?.[0] || "";
+}
+
+function normalizeText(value) {
+  return String(value)
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 async function submitPrompt(page, prompt) {
