@@ -58,6 +58,7 @@ When using the tool:
 - Use `mode_selection_strategy: "skip"` only after the user confirms they manually selected Pro in the browser.
 - Keep `long_prompt_strategy: "chunk"` for large diffs or logs unless the user explicitly wants fail-fast behavior.
 - Include enough context in the prompt because the web conversation is separate from the Codex thread.
+- If `ask_chatgpt_pro` returns `answer_status: "streaming"` or `answer_status: "timeout_partial"`, or if the Codex tool call is interrupted while ChatGPT may still be generating, do not send a follow-up "continue" prompt immediately. Call `read_chatgpt_pro_response` to wait for and read the latest assistant response without submitting new text.
 - Treat the returned answer as a second opinion, not as an authoritative source for current facts unless it cites verifiable sources.
 - Do not kill the running MCP server process from the same Codex thread to force a plugin reload. If plugin code was upgraded, ask the user to start a new Codex thread or reinstall/upgrade the plugin outside the active tool call path.
 

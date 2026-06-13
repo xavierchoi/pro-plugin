@@ -240,6 +240,47 @@ const tools = [
       additionalProperties: false,
     },
   },
+  {
+    name: "read_chatgpt_pro_response",
+    description:
+      "Read or wait for the latest ChatGPT assistant response without submitting a new prompt.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        cdp_endpoint: {
+          type: "string",
+          description:
+            "Chrome DevTools endpoint. Defaults to CHATGPT_PRO_CDP_ENDPOINT or http://127.0.0.1:9222.",
+        },
+        conversation_mode: {
+          type: "string",
+          enum: ["current", "named"],
+          default: "current",
+          description:
+            "Read from the current visible ChatGPT conversation or a named saved conversation URL.",
+        },
+        session_name: {
+          type: "string",
+          description:
+            "Named saved ChatGPT conversation to reopen when conversation_mode=named.",
+        },
+        wait_for_completion: {
+          type: "boolean",
+          default: true,
+          description:
+            "When true, wait until the latest response appears complete or timeout_partial.",
+        },
+        timeout_ms: {
+          type: "integer",
+          minimum: 1000,
+          maximum: 1800000,
+          default: DEFAULT_TIMEOUT_MS,
+          description: "Maximum wait time when wait_for_completion is true.",
+        },
+      },
+      additionalProperties: false,
+    },
+  },
 ];
 
 const rl = createInterface({
@@ -308,6 +349,9 @@ async function dispatch(method, params) {
     }
     if (name === "ask_chatgpt_pro") {
       return textResult(await askChatGptPro(args));
+    }
+    if (name === "read_chatgpt_pro_response") {
+      return textResult(await readChatGptProResponse(args));
     }
     throw new Error(`Unknown tool: ${name}`);
   }
@@ -769,17 +813,19 @@ async function askChatGptPro(args) {
       longPromptStrategy,
     );
     let answer = "";
+    let answerResponse = null;
     for (let index = 0; index < promptPlan.messages.length; index += 1) {
       const message = promptPlan.messages[index];
       const beforeCount = await assistantMessageCount(page);
       await submitPrompt(page, message);
-      const response = await waitForStableAssistantText(
-        page,
+      const response = await waitForAssistantResponse(page, {
         beforeCount,
         timeoutMs,
-      );
+        requireNewMessage: true,
+      });
       if (index === promptPlan.messages.length - 1) {
-        answer = response;
+        answer = response.text;
+        answerResponse = response;
       }
     }
 
@@ -795,7 +841,46 @@ async function askChatGptPro(args) {
           ? { name: sessionName, url: page.url() }
           : undefined,
         prompt_plan: promptPlan.summary,
+        answer_status: answerResponse?.status || "unknown",
+        still_running: answerResponse?.still_running,
+        response: answerResponse,
         answer,
+      },
+      null,
+      2,
+    );
+  } finally {
+    await close();
+  }
+}
+
+async function readChatGptProResponse(args) {
+  const timeoutMs = Number(args.timeout_ms || DEFAULT_TIMEOUT_MS);
+  const conversationMode = args.conversation_mode || "current";
+  const sessionName = normalizeSessionName(args.session_name);
+  const { browser, close } = await connectBrowser(args.cdp_endpoint);
+
+  try {
+    const page = await getChatGptPage(browser, conversationMode, sessionName);
+    page.setDefaultTimeout(Math.min(timeoutMs, 60000));
+
+    const response = args.wait_for_completion === false
+      ? await readLatestAssistantResponse(page)
+      : await waitForAssistantResponse(page, {
+          beforeCount: 0,
+          timeoutMs,
+          requireNewMessage: false,
+        });
+
+    return JSON.stringify(
+      {
+        ok: Boolean(response.text),
+        conversation: {
+          mode: conversationMode,
+          session_name: sessionName || undefined,
+          url: page.url(),
+        },
+        response,
       },
       null,
       2,
@@ -1713,16 +1798,22 @@ async function submitPrompt(page, prompt) {
   }
 }
 
-async function waitForStableAssistantText(page, beforeCount, timeoutMs) {
+async function waitForAssistantResponse(
+  page,
+  { beforeCount = 0, timeoutMs = DEFAULT_TIMEOUT_MS, requireNewMessage = true } = {},
+) {
   const deadline = Date.now() + timeoutMs;
   let lastText = "";
   let stableSamples = 0;
+  let lastCount = 0;
 
   while (Date.now() < deadline) {
     const count = await assistantMessageCount(page);
     const text = await lastAssistantText(page);
+    const stillRunning = await responseStillRunning(page);
+    lastCount = count;
 
-    if (count > beforeCount && text.trim().length > 0) {
+    if ((!requireNewMessage || count > beforeCount) && text.trim().length > 0) {
       if (text === lastText) {
         stableSamples += 1;
       } else {
@@ -1730,19 +1821,45 @@ async function waitForStableAssistantText(page, beforeCount, timeoutMs) {
         lastText = text;
       }
 
-      if (stableSamples >= 4 && !(await responseStillRunning(page))) {
-        return text.trim();
+      if (stableSamples >= 4 && !stillRunning) {
+        return {
+          status: "complete",
+          text: text.trim(),
+          still_running: false,
+          assistant_message_count: count,
+          stable_samples: stableSamples,
+        };
       }
     }
 
     await page.waitForTimeout(1500);
   }
 
-  if (lastText.trim()) {
-    return lastText.trim();
+  const stillRunning = await responseStillRunning(page);
+  const latest = (await lastAssistantText(page)).trim() || lastText.trim();
+  if (latest) {
+    return {
+      status: stillRunning ? "streaming" : "timeout_partial",
+      text: latest,
+      still_running: stillRunning,
+      assistant_message_count: lastCount || (await assistantMessageCount(page)),
+      stable_samples: stableSamples,
+    };
   }
 
   throw new Error("Timed out waiting for a ChatGPT response.");
+}
+
+async function readLatestAssistantResponse(page) {
+  const text = (await lastAssistantText(page)).trim();
+  const stillRunning = await responseStillRunning(page);
+  return {
+    status: stillRunning ? "streaming" : text ? "complete" : "empty",
+    text,
+    still_running: stillRunning,
+    assistant_message_count: await assistantMessageCount(page),
+    stable_samples: 0,
+  };
 }
 
 async function assistantMessageCount(page) {
@@ -1767,15 +1884,38 @@ async function responseStillRunning(page) {
     const labels = [
       "Stop streaming",
       "Stop generating",
+      "Stop responding",
       "Cancel",
+      "중지",
+      "생성 중지",
+      "응답 중지",
+      "취소",
     ];
-    return labels.some((label) =>
-      Array.from(document.querySelectorAll("button")).some((button) =>
-        (button.getAttribute("aria-label") || button.innerText || "")
-          .toLowerCase()
-          .includes(label.toLowerCase()),
-      ),
-    );
+    const buttons = Array.from(document.querySelectorAll("button"));
+    if (
+      labels.some((label) =>
+        buttons.some((button) =>
+          (button.getAttribute("aria-label") || button.innerText || "")
+            .toLowerCase()
+            .includes(label.toLowerCase()),
+        ),
+      )
+    ) {
+      return true;
+    }
+
+    return buttons.some((button) => {
+      const label = `${button.getAttribute("aria-label") || ""} ${button.innerText || ""}`.trim();
+      const rect = button.getBoundingClientRect();
+      const visible = rect.width > 0 && rect.height > 0;
+      const looksLikeStop =
+        visible &&
+        rect.width <= 80 &&
+        rect.height <= 80 &&
+        (button.querySelector('svg rect, svg [d*="M6"], svg [d*="m6"]') ||
+          /stop|중지/i.test(label));
+      return Boolean(looksLikeStop);
+    });
   });
 }
 
