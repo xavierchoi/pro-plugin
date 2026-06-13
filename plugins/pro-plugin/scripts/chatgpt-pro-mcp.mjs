@@ -660,8 +660,7 @@ async function status(args) {
       const page = chatgptPages[0];
       await page.bringToFront().catch(() => {});
       const composer = await findComposer(page);
-      const bodyText = await visibleBodyText(page);
-      const modelHints = extractModelHints(bodyText);
+      const modelHints = await visibleModelHints(page);
       diagnostics.checks.push({
         name: "chatgpt_login",
         ok: Boolean(composer),
@@ -954,6 +953,14 @@ async function selectProMode(page, targetModel = "GPT-5.5 Pro") {
     '[data-testid*="model-switcher" i]',
     'button:has-text("지능")',
     'button[aria-haspopup="menu"]:has-text("지능")',
+    'button:has-text("즉시")',
+    'button:has-text("중간")',
+    'button:has-text("높음")',
+    'button:has-text("매우 높음")',
+    'button:has-text("Instant")',
+    'button:has-text("Medium")',
+    'button:has-text("High")',
+    'button:has-text("Thinking")',
     'button[aria-haspopup="menu"]:has-text("GPT")',
     'button[aria-haspopup="listbox"]:has-text("GPT")',
     'button[aria-label*="model" i]',
@@ -1081,10 +1088,31 @@ async function dynamicPickerCandidates(page) {
       .map((element, index) => {
         const text = compactText(element);
         const lower = text.toLowerCase();
+        const inSidebar = Boolean(
+          element.closest(
+            [
+              "aside",
+              "nav",
+              '[data-testid*="sidebar" i]',
+              '[class*="sidebar" i]',
+            ].join(", "),
+          ),
+        );
+        const rect = element.getBoundingClientRect();
+        const centerX = rect.left + rect.width / 2;
+        const centerY = rect.top + rect.height / 2;
         let score = 0;
         if (/model|chatgpt|gpt|pro/.test(lower)) score += 30;
         if (/지능|모델|즉시|중간|높음|매우\s*높음/.test(text)) score += 30;
         if (element.getAttribute("aria-haspopup")) score += 20;
+        if (
+          centerX > window.innerWidth * 0.25 &&
+          centerX < window.innerWidth * 0.85 &&
+          centerY > window.innerHeight * 0.35
+        ) {
+          score += 15;
+        }
+        if (inSidebar) score -= 100;
         if (/send|new chat|sidebar|검색|첨부|voice|dictate/i.test(text)) score -= 60;
         if (!text || text.length > 180 || score <= 0) return null;
 
@@ -1188,9 +1216,9 @@ async function scoredMenuCandidates(page, targetModel) {
         .trim();
     }
 
-    const menuRoots = Array.from(document.querySelectorAll(menuSelector))
+    const roots = Array.from(document.querySelectorAll(menuSelector))
       .filter((element) => element instanceof HTMLElement && visible(element));
-    const roots = menuRoots.length > 0 ? menuRoots : [document.body];
+    if (roots.length === 0) return [];
     const seen = new Set();
     const results = [];
 
@@ -1398,8 +1426,66 @@ async function responseStillRunning(page) {
   });
 }
 
-async function visibleBodyText(page) {
-  return page.evaluate(() => document.body?.innerText || "").catch(() => "");
+async function visibleModelHints(page) {
+  return page.evaluate(() => {
+    const selector = [
+      "button",
+      '[role="button"]',
+      '[aria-haspopup]',
+      '[data-testid*="model" i]',
+    ].join(", ");
+
+    function visible(element) {
+      const rect = element.getBoundingClientRect();
+      const style = window.getComputedStyle(element);
+      return (
+        rect.width > 0 &&
+        rect.height > 0 &&
+        style.visibility !== "hidden" &&
+        style.display !== "none"
+      );
+    }
+
+    function compactText(element) {
+      return [
+        element.innerText,
+        element.textContent,
+        element.getAttribute("aria-label"),
+        element.getAttribute("data-testid"),
+        element.getAttribute("title"),
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .replace(/\s+/g, " ")
+        .trim();
+    }
+
+    const hints = new Set();
+    for (const element of Array.from(document.querySelectorAll(selector))) {
+      if (!(element instanceof HTMLElement) || !visible(element)) continue;
+      if (
+        element.closest(
+          [
+            "aside",
+            "nav",
+            '[data-testid*="sidebar" i]',
+            '[class*="sidebar" i]',
+          ].join(", "),
+        )
+      ) {
+        continue;
+      }
+      const text = compactText(element);
+      if (
+        /(?:GPT-?5\.5|GPT-?5|ChatGPT|Pro|프로|Instant|Thinking|즉시|중간|높음|매우\s*높음)/i.test(
+          text,
+        )
+      ) {
+        hints.add(text);
+      }
+    }
+    return Array.from(hints).slice(0, 12);
+  }).catch(() => []);
 }
 
 async function firstVisibleLocator(page, selectors) {
@@ -1485,17 +1571,6 @@ function splitText(text, chunkSize) {
     offset = end;
   }
   return chunks.filter(Boolean);
-}
-
-function extractModelHints(text) {
-  const hints = new Set();
-  for (const match of text.matchAll(/(?:GPT-?5\.5|GPT-?5|ChatGPT)\s*(?:Pro|Thinking|Instant)?/gi)) {
-    hints.add(match[0].trim());
-  }
-  for (const match of text.matchAll(/\b(?:Pro|Thinking|Instant)\b/g)) {
-    hints.add(match[0].trim());
-  }
-  return Array.from(hints).slice(0, 12);
 }
 
 function launchAgentPlist(label, programArguments) {
