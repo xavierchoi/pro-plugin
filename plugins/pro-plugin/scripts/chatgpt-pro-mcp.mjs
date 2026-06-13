@@ -945,6 +945,10 @@ async function findComposer(page) {
 
 async function selectProMode(page, targetModel = "GPT-5.5 Pro") {
   const attempts = [];
+  const alreadyOpen = await chooseVisibleProMode(page, targetModel);
+  if (alreadyOpen.selected) return alreadyOpen;
+  attempts.push(...alreadyOpen.visible_menu_candidates);
+
   const pickerSelectors = [
     '[data-testid="model-switcher-dropdown-button"]',
     '[data-testid*="model-switcher" i]',
@@ -959,45 +963,20 @@ async function selectProMode(page, targetModel = "GPT-5.5 Pro") {
     'button:has-text("ChatGPT")',
   ];
 
-  for (const selector of pickerSelectors) {
-    const picker = page.locator(selector).first();
-    if (!(await isVisible(picker, 1000))) continue;
+  for (const picker of await pickerCandidates(page, pickerSelectors)) {
+    attempts.push({ ...picker.summary, kind: "picker" });
+    if (picker.locator) {
+      if (!(await isVisible(picker.locator, 1000))) continue;
+      await picker.locator.click().catch(() => {});
+    } else {
+      await page.locator(`[data-pro-plugin-picker-candidate="${picker.marker}"]`).first().click().catch(() => {});
+    }
 
-    await picker.click().catch(() => {});
     await page.waitForTimeout(700);
 
-    const option = await bestProModeCandidate(page, targetModel);
-    if (option) {
-      await option.locator.click().catch(() => {});
-      await page.waitForTimeout(1000);
-      return {
-        selected: true,
-        target_model: targetModel,
-        reason: `Clicked Pro-like menu option: ${option.text}`,
-        candidate: option.summary,
-      };
-    }
-
-    attempts.push(...(await menuCandidateSummaries(page, targetModel)));
-
-    const submenu = await bestModelSubmenuCandidate(page, targetModel);
-    if (submenu) {
-      await submenu.locator.click().catch(() => {});
-      await page.waitForTimeout(700);
-      const nestedOption = await bestProModeCandidate(page, targetModel);
-      if (nestedOption) {
-        await nestedOption.locator.click().catch(() => {});
-        await page.waitForTimeout(1000);
-        return {
-          selected: true,
-          target_model: targetModel,
-          reason: `Clicked Pro-like menu option after opening submenu: ${nestedOption.text}`,
-          submenu: submenu.summary,
-          candidate: nestedOption.summary,
-        };
-      }
-      attempts.push(...(await menuCandidateSummaries(page, targetModel)));
-    }
+    const result = await chooseVisibleProMode(page, targetModel, picker.summary);
+    if (result.selected) return result;
+    attempts.push(...result.visible_menu_candidates);
 
     await page.keyboard.press("Escape").catch(() => {});
   }
@@ -1006,8 +985,129 @@ async function selectProMode(page, targetModel = "GPT-5.5 Pro") {
     selected: false,
     target_model: targetModel,
     reason: `No high-confidence Pro-like option was found in the visible model/effort menu for ${targetModel}.`,
-    visible_menu_candidates: attempts.slice(0, 12),
+    visible_menu_candidates: dedupeSummaries(attempts).slice(0, 16),
   };
+}
+
+async function chooseVisibleProMode(page, targetModel, pickerSummary) {
+  const option = await bestProModeCandidate(page, targetModel);
+  if (option) {
+    await option.locator.click().catch(() => {});
+    await page.waitForTimeout(1000);
+    return {
+      selected: true,
+      target_model: targetModel,
+      reason: `Clicked Pro-like menu option: ${option.text}`,
+      picker: pickerSummary,
+      candidate: option.summary,
+    };
+  }
+
+  const attempts = await menuCandidateSummaries(page, targetModel);
+  const submenu = await bestModelSubmenuCandidate(page, targetModel);
+  if (submenu) {
+    await submenu.locator.click().catch(() => {});
+    await page.waitForTimeout(700);
+    const nestedOption = await bestProModeCandidate(page, targetModel);
+    if (nestedOption) {
+      await nestedOption.locator.click().catch(() => {});
+      await page.waitForTimeout(1000);
+      return {
+        selected: true,
+        target_model: targetModel,
+        reason: `Clicked Pro-like menu option after opening submenu: ${nestedOption.text}`,
+        picker: pickerSummary,
+        submenu: submenu.summary,
+        candidate: nestedOption.summary,
+      };
+    }
+    attempts.push(...(await menuCandidateSummaries(page, targetModel)));
+  }
+
+  return {
+    selected: false,
+    target_model: targetModel,
+    reason: "No visible Pro-like menu option was found.",
+    visible_menu_candidates: attempts,
+  };
+}
+
+async function pickerCandidates(page, fixedSelectors) {
+  const fixed = fixedSelectors.map((selector) => ({
+    locator: page.locator(selector).first(),
+    summary: { text: selector, source: "fixed-selector" },
+  }));
+  const dynamic = await dynamicPickerCandidates(page);
+  return [...fixed, ...dynamic];
+}
+
+async function dynamicPickerCandidates(page) {
+  const candidates = await page.evaluate(() => {
+    const clickableSelector = [
+      "button",
+      '[role="button"]',
+      '[aria-haspopup]',
+      "[data-testid]",
+      "[tabindex]",
+    ].join(", ");
+
+    function visible(element) {
+      const rect = element.getBoundingClientRect();
+      const style = window.getComputedStyle(element);
+      return (
+        rect.width > 0 &&
+        rect.height > 0 &&
+        style.visibility !== "hidden" &&
+        style.display !== "none"
+      );
+    }
+
+    function compactText(element) {
+      return [
+        element.innerText,
+        element.textContent,
+        element.getAttribute("aria-label"),
+        element.getAttribute("data-testid"),
+        element.getAttribute("title"),
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .replace(/\s+/g, " ")
+        .trim();
+    }
+
+    return Array.from(document.querySelectorAll(clickableSelector))
+      .filter((element) => element instanceof HTMLElement && visible(element))
+      .map((element, index) => {
+        const text = compactText(element);
+        const lower = text.toLowerCase();
+        let score = 0;
+        if (/model|chatgpt|gpt|pro/.test(lower)) score += 30;
+        if (/지능|모델|즉시|중간|높음|매우\s*높음/.test(text)) score += 30;
+        if (element.getAttribute("aria-haspopup")) score += 20;
+        if (/send|new chat|sidebar|검색|첨부|voice|dictate/i.test(text)) score -= 60;
+        if (!text || text.length > 180 || score <= 0) return null;
+
+        const marker = `pro-plugin-picker-${index}`;
+        element.setAttribute("data-pro-plugin-picker-candidate", marker);
+        return {
+          marker,
+          text,
+          score,
+          role: element.getAttribute("role") || "",
+          aria_haspopup: element.getAttribute("aria-haspopup") || "",
+          tag: element.tagName,
+        };
+      })
+      .filter(Boolean)
+      .sort((left, right) => right.score - left.score)
+      .slice(0, 8);
+  });
+
+  return candidates.map((candidate) => ({
+    marker: candidate.marker,
+    summary: candidate,
+  }));
 }
 
 async function bestProModeCandidate(page, targetModel) {
@@ -1175,6 +1275,18 @@ function scoreModeCandidate(candidate, targetModel) {
       has_popup: candidate.has_popup,
     },
   };
+}
+
+function dedupeSummaries(summaries) {
+  const seen = new Set();
+  const deduped = [];
+  for (const summary of summaries) {
+    const key = `${summary.text || ""}:${summary.score ?? ""}:${summary.source || ""}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(summary);
+  }
+  return deduped;
 }
 
 function targetTerms(targetModel) {
