@@ -2,8 +2,9 @@
 
 import { createInterface } from "node:readline";
 import { spawn, spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -11,6 +12,7 @@ import { fileURLToPath } from "node:url";
 const DEFAULT_CDP_ENDPOINT =
   process.env.CHATGPT_PRO_CDP_ENDPOINT || "http://127.0.0.1:9222";
 const DEFAULT_TIMEOUT_MS = Number(process.env.CHATGPT_PRO_TIMEOUT_MS || 180000);
+const DEFAULT_JOB_TIMEOUT_MS = Number(process.env.CHATGPT_PRO_JOB_TIMEOUT_MS || 1800000);
 const CHATGPT_URL = process.env.CHATGPT_PRO_URL || "https://chatgpt.com/";
 const DEFAULT_MAX_PROMPT_CHARS = Number(
   process.env.CHATGPT_PRO_MAX_PROMPT_CHARS || 24000,
@@ -18,9 +20,13 @@ const DEFAULT_MAX_PROMPT_CHARS = Number(
 const SESSION_STORE_PATH =
   process.env.CHATGPT_PRO_SESSION_STORE ||
   join(homedir(), ".cache", "pro-plugin", "sessions.json");
+const CACHE_DIR = join(homedir(), ".cache", "pro-plugin");
+const JOBS_DIR = process.env.CHATGPT_PRO_JOBS_DIR || join(CACHE_DIR, "jobs");
+const LOCKS_DIR = process.env.CHATGPT_PRO_LOCKS_DIR || join(CACHE_DIR, "locks");
 const DEFAULT_CDP_PORT = Number(process.env.CHATGPT_PRO_CDP_PORT || 9222);
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const PLUGIN_DIR = dirname(SCRIPT_DIR);
+const JOB_LOCK_STALE_MS = Number(process.env.CHATGPT_PRO_JOB_LOCK_STALE_MS || 12 * 60 * 60 * 1000);
 
 const tools = [
   {
@@ -241,6 +247,133 @@ const tools = [
     },
   },
   {
+    name: "start_chatgpt_pro_job",
+    description:
+      "Start a long-running ChatGPT Pro request in a detached worker and return a persistent job id immediately.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        prompt: {
+          type: "string",
+          description: "The full prompt to submit to ChatGPT Pro mode.",
+        },
+        job_name: {
+          type: "string",
+          description:
+            "Optional human-readable label for this background job.",
+        },
+        cdp_endpoint: {
+          type: "string",
+          description:
+            "Chrome DevTools endpoint. Defaults to CHATGPT_PRO_CDP_ENDPOINT or http://127.0.0.1:9222.",
+        },
+        conversation_mode: {
+          type: "string",
+          enum: ["new", "current", "named"],
+          default: "new",
+          description:
+            "Use a fresh ChatGPT conversation, continue the current visible one, or reuse a named saved ChatGPT URL.",
+        },
+        session_name: {
+          type: "string",
+          description:
+            "Optional stable name for a ChatGPT web conversation. When set with conversation_mode=named, the tool reopens the saved URL when possible.",
+        },
+        target_model: {
+          type: "string",
+          default: "GPT-5.5 Pro",
+          description:
+            "Visible model/mode label to select in ChatGPT. Defaults to GPT-5.5 Pro.",
+        },
+        require_pro_mode: {
+          type: "boolean",
+          default: true,
+          description:
+            "Fail if the tool cannot confidently select a Pro mode control.",
+        },
+        mode_selection_strategy: {
+          type: "string",
+          enum: ["auto", "strict-dom", "legacy-dom", "skip"],
+          default: "auto",
+          description:
+            "How to select ChatGPT Pro effort. auto tries strict DOM/coordinate selection before legacy DOM fallback; skip assumes the visible browser state is already correct.",
+        },
+        timeout_ms: {
+          type: "integer",
+          minimum: 30000,
+          maximum: 7200000,
+          default: DEFAULT_JOB_TIMEOUT_MS,
+          description: "Maximum wait time for the background web answer.",
+        },
+        long_prompt_strategy: {
+          type: "string",
+          enum: ["chunk", "fail", "truncate"],
+          default: "chunk",
+          description:
+            "How to handle prompts longer than max_prompt_chars before the final answer request.",
+        },
+        max_prompt_chars: {
+          type: "integer",
+          minimum: 4000,
+          maximum: 120000,
+          default: DEFAULT_MAX_PROMPT_CHARS,
+          description:
+            "Character limit for a single ChatGPT composer submission before long_prompt_strategy is applied.",
+        },
+      },
+      required: ["prompt"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "chatgpt_pro_job_status",
+    description:
+      "Read the persisted status for a background ChatGPT Pro job.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        job_id: {
+          type: "string",
+          description: "Job id returned by start_chatgpt_pro_job.",
+        },
+      },
+      required: ["job_id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "read_chatgpt_pro_job_result",
+    description:
+      "Read a background ChatGPT Pro job result, including partial text while it is still running.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        job_id: {
+          type: "string",
+          description: "Job id returned by start_chatgpt_pro_job.",
+        },
+      },
+      required: ["job_id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "cancel_chatgpt_pro_job",
+    description:
+      "Request cancellation for a background ChatGPT Pro job and try to stop generation in the browser.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        job_id: {
+          type: "string",
+          description: "Job id returned by start_chatgpt_pro_job.",
+        },
+      },
+      required: ["job_id"],
+      additionalProperties: false,
+    },
+  },
+  {
     name: "read_chatgpt_pro_response",
     description:
       "Read or wait for the latest ChatGPT assistant response without submitting a new prompt.",
@@ -283,7 +416,12 @@ const tools = [
   },
 ];
 
-if (isDirectRun()) {
+if (isJobWorkerRun()) {
+  await runJobWorker(process.argv[3]).catch((error) => {
+    process.stderr.write(`chatgpt-pro job worker failed: ${error.stack || error.message}\n`);
+    process.exitCode = 1;
+  });
+} else if (isDirectRun()) {
   startServer();
 }
 
@@ -325,6 +463,10 @@ function isDirectRun() {
   return Boolean(process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url));
 }
 
+function isJobWorkerRun() {
+  return isDirectRun() && process.argv[2] === "--run-job";
+}
+
 async function dispatch(method, params) {
   if (method === "initialize") {
     return {
@@ -359,6 +501,18 @@ async function dispatch(method, params) {
     }
     if (name === "ask_chatgpt_pro") {
       return textResult(await askChatGptPro(args));
+    }
+    if (name === "start_chatgpt_pro_job") {
+      return textResult(await startChatGptProJob(args));
+    }
+    if (name === "chatgpt_pro_job_status") {
+      return textResult(await chatGptProJobStatus(args));
+    }
+    if (name === "read_chatgpt_pro_job_result") {
+      return textResult(await readChatGptProJobResult(args));
+    }
+    if (name === "cancel_chatgpt_pro_job") {
+      return textResult(await cancelChatGptProJob(args));
     }
     if (name === "read_chatgpt_pro_response") {
       return textResult(await readChatGptProResponse(args));
@@ -833,23 +987,31 @@ async function status(args) {
 }
 
 async function askChatGptPro(args) {
+  return JSON.stringify(await runChatGptProAsk(args), null, 2);
+}
+
+async function runChatGptProAsk(args, hooks = {}) {
   if (!args.prompt || !args.prompt.trim()) {
     throw new Error("prompt is required");
   }
 
-  const timeoutMs = Number(args.timeout_ms || DEFAULT_TIMEOUT_MS);
+  const timeoutMs = Number(args.timeout_ms || hooks.defaultTimeoutMs || DEFAULT_TIMEOUT_MS);
   const requireProMode = args.require_pro_mode !== false;
   const sessionName = normalizeSessionName(args.session_name);
   const conversationMode =
     args.conversation_mode || (sessionName ? "named" : "new");
   const longPromptStrategy = args.long_prompt_strategy || "chunk";
   const maxPromptChars = Number(args.max_prompt_chars || DEFAULT_MAX_PROMPT_CHARS);
+  await hooks.onStage?.("connecting_browser", { cdp_endpoint: args.cdp_endpoint || DEFAULT_CDP_ENDPOINT });
   const { browser, close } = await connectBrowser(args.cdp_endpoint);
 
   try {
+    await hooks.onStage?.("opening_conversation", { conversation_mode: conversationMode, session_name: sessionName || undefined });
+    await throwIfCancelled(hooks);
     const page = await getChatGptPage(browser, conversationMode, sessionName);
     page.setDefaultTimeout(Math.min(timeoutMs, 60000));
 
+    await hooks.onStage?.("waiting_for_composer", { url: page.url() });
     const loginReady = await waitForComposer(page, timeoutMs);
     if (!loginReady) {
       throw new Error(
@@ -857,9 +1019,15 @@ async function askChatGptPro(args) {
       );
     }
 
+    await hooks.onStage?.("selecting_model", {
+      target_model: args.target_model || "GPT-5.5 Pro",
+      mode_selection_strategy: args.mode_selection_strategy || "auto",
+    });
+    await throwIfCancelled(hooks);
     const proSelection = await selectProMode(page, args.target_model || "GPT-5.5 Pro", {
       strategy: args.mode_selection_strategy || "auto",
     });
+    await hooks.onStage?.("model_selected", { pro_mode: proSelection });
     if (!proSelection.selected && requireProMode) {
       throw new Error(
         `Could not confidently select Pro mode: ${proSelection.reason}. Visible candidates: ${JSON.stringify(proSelection.visible_menu_candidates || [])}. Set require_pro_mode=false for a best-effort call.`,
@@ -871,38 +1039,53 @@ async function askChatGptPro(args) {
       maxPromptChars,
       longPromptStrategy,
     );
+    await hooks.onStage?.("prompt_planned", { prompt_plan: promptPlan.summary });
     let answer = "";
     let answerResponse = null;
     for (let index = 0; index < promptPlan.messages.length; index += 1) {
+      await throwIfCancelled(hooks);
       const message = promptPlan.messages[index];
       const beforeCount = await assistantMessageCount(page);
+      await hooks.onStage?.("submitting_prompt", {
+        message_index: index + 1,
+        message_count: promptPlan.messages.length,
+        message_chars: message.length,
+      });
       await submitPrompt(page, message);
+      await hooks.onStage?.("waiting_for_response", {
+        message_index: index + 1,
+        message_count: promptPlan.messages.length,
+      });
       const response = await waitForAssistantResponse(page, {
         beforeCount,
         timeoutMs,
         requireNewMessage: true,
       });
+      await hooks.onStage?.("response_received", {
+        message_index: index + 1,
+        message_count: promptPlan.messages.length,
+        answer_status: response.status,
+        still_running: response.still_running,
+        partial_chars: response.text?.length || 0,
+        response,
+      });
       if (shouldAbortChunkResponse(index, promptPlan.messages.length, response)) {
-        return JSON.stringify(
-          {
-            ok: false,
-            pro_mode: proSelection,
-            session: sessionName
-              ? { name: sessionName, url: page.url() }
-              : undefined,
-            prompt_plan: promptPlan.summary,
-            interrupted_at_message: index + 1,
-            answer_status: response.status,
-            still_running: response.still_running,
-            response,
-            next_steps: [
-              "The previous context chunk did not finish cleanly, so the plugin did not submit the next chunk.",
-              "Use read_chatgpt_pro_response with wait_for_completion=true to collect the current response before retrying.",
-            ],
-          },
-          null,
-          2,
-        );
+        return {
+          ok: false,
+          pro_mode: proSelection,
+          session: sessionName
+            ? { name: sessionName, url: page.url() }
+            : undefined,
+          prompt_plan: promptPlan.summary,
+          interrupted_at_message: index + 1,
+          answer_status: response.status,
+          still_running: response.still_running,
+          response,
+          next_steps: [
+            "The previous context chunk did not finish cleanly, so the plugin did not submit the next chunk.",
+            "Use read_chatgpt_pro_response with wait_for_completion=true to collect the current response before retrying.",
+          ],
+        };
       }
       if (index === promptPlan.messages.length - 1) {
         answer = response.text;
@@ -914,22 +1097,18 @@ async function askChatGptPro(args) {
       await saveNamedSession(sessionName, page.url());
     }
 
-    return JSON.stringify(
-      {
-        ok: true,
-        pro_mode: proSelection,
-        session: sessionName
-          ? { name: sessionName, url: page.url() }
-          : undefined,
-        prompt_plan: promptPlan.summary,
-        answer_status: answerResponse?.status || "unknown",
-        still_running: answerResponse?.still_running,
-        response: answerResponse,
-        answer,
-      },
-      null,
-      2,
-    );
+    return {
+      ok: true,
+      pro_mode: proSelection,
+      session: sessionName
+        ? { name: sessionName, url: page.url() }
+        : undefined,
+      prompt_plan: promptPlan.summary,
+      answer_status: answerResponse?.status || "unknown",
+      still_running: answerResponse?.still_running,
+      response: answerResponse,
+      answer,
+    };
   } finally {
     await close();
   }
@@ -969,6 +1148,549 @@ async function readChatGptProResponse(args) {
   } finally {
     await close();
   }
+}
+
+async function startChatGptProJob(args) {
+  if (!args.prompt || !args.prompt.trim()) {
+    throw new Error("prompt is required");
+  }
+
+  const cdpEndpoint = args.cdp_endpoint || DEFAULT_CDP_ENDPOINT;
+  const activeLock = await readBrowserLock(cdpEndpoint);
+  if (activeLock.active) {
+    return JSON.stringify(
+      {
+        ok: false,
+        error: "A ChatGPT Pro job is already using this CDP browser endpoint.",
+        active_job: activeLock.lock,
+        next_steps: [
+          "Wait for the active job to finish, read its result, or cancel it before starting another job on the same browser.",
+        ],
+      },
+      null,
+      2,
+    );
+  }
+
+  const jobId = newJobId();
+  const job = {
+    id: jobId,
+    name: normalizeJobName(args.job_name),
+    status: "queued",
+    stage: "queued",
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    worker_pid: null,
+    cdp_endpoint: cdpEndpoint,
+    lock_key: endpointLockKey(cdpEndpoint),
+    cancel_requested: false,
+    request: jobRequestSummary(args),
+    args: {
+      ...args,
+      cdp_endpoint: cdpEndpoint,
+      timeout_ms: Number(args.timeout_ms || DEFAULT_JOB_TIMEOUT_MS),
+    },
+    partial: null,
+    result: null,
+    error: null,
+  };
+  await writeJob(job);
+
+  const child = spawn(process.execPath, [fileURLToPath(import.meta.url), "--run-job", jobId], {
+    cwd: PLUGIN_DIR,
+    detached: true,
+    stdio: "ignore",
+    env: {
+      ...process.env,
+      CHATGPT_PRO_JOB_WORKER: "1",
+    },
+  });
+  child.unref();
+  await markJobWorkerSpawned(jobId, child.pid);
+
+  return JSON.stringify(
+    {
+      ok: true,
+      job: publicJob(await loadJob(jobId)),
+      next_steps: [
+        `Poll chatgpt_pro_job_status with job_id=${jobId}.`,
+        "Use read_chatgpt_pro_job_result for partial or final text.",
+        "Use cancel_chatgpt_pro_job if you need to stop the browser generation.",
+      ],
+    },
+    null,
+    2,
+  );
+}
+
+async function chatGptProJobStatus(args) {
+  const job = await refreshJobLiveness(await loadJob(requiredJobId(args.job_id)));
+  return JSON.stringify(
+    {
+      ok: true,
+      job: publicJob(job),
+    },
+    null,
+    2,
+  );
+}
+
+async function readChatGptProJobResult(args) {
+  const job = await refreshJobLiveness(await loadJob(requiredJobId(args.job_id)));
+  return JSON.stringify(
+    {
+      ok: Boolean(job.result?.answer || job.partial?.text),
+      job: publicJob(job),
+      partial: job.partial || null,
+      response: job.result?.response || job.partial?.response || null,
+      answer: job.result?.answer || job.partial?.text || "",
+      result: job.result || null,
+    },
+    null,
+    2,
+  );
+}
+
+async function cancelChatGptProJob(args) {
+  const jobId = requiredJobId(args.job_id);
+  const job = await refreshJobLiveness(await loadJob(jobId));
+  if (isTerminalJobStatus(job.status) && !canCancelTimedOutJob(job)) {
+    return JSON.stringify(
+      {
+        ok: true,
+        already_terminal: true,
+        job: publicJob(job),
+      },
+      null,
+      2,
+    );
+  }
+
+  await updateJob(jobId, {
+    status: "cancelling",
+    stage: "cancel_requested",
+    cancel_requested: true,
+  });
+
+  const stop = await stopChatGptGeneration(job.cdp_endpoint).catch((error) => ({
+    ok: false,
+    error: error.message,
+  }));
+  const updated = await updateJob(jobId, {
+    stop_attempt: stop,
+  });
+
+  return JSON.stringify(
+    {
+      ok: true,
+      job: publicJob(updated),
+      stop_attempt: stop,
+      next_steps: [
+        "Poll chatgpt_pro_job_status until the worker records cancelled, failed, or a terminal partial result.",
+      ],
+    },
+    null,
+    2,
+  );
+}
+
+async function runJobWorker(jobId) {
+  const id = requiredJobId(jobId);
+  let lock = null;
+  try {
+    let job = await updateJob(id, {
+      status: "starting",
+      stage: "worker_starting",
+      worker_pid: process.pid,
+      worker_started_at: new Date().toISOString(),
+    });
+
+    lock = await acquireBrowserLock(job.cdp_endpoint, id);
+    if (!lock.acquired) {
+      await updateJob(id, {
+        status: "failed",
+        stage: "browser_busy",
+        error: {
+          message: "Another ChatGPT Pro job is already using this CDP browser endpoint.",
+          active_job: lock.active || null,
+        },
+      });
+      return;
+    }
+
+    await updateJob(id, {
+      status: "running",
+      stage: "browser_locked",
+      lock: lock.lock,
+    });
+
+    const result = await runChatGptProAsk(job.args, {
+      defaultTimeoutMs: DEFAULT_JOB_TIMEOUT_MS,
+      onStage: async (stage, detail = {}) => {
+        await updateJobStage(id, stage, detail);
+      },
+      isCancelled: async () => {
+        const fresh = await loadJob(id);
+        return Boolean(fresh.cancel_requested);
+      },
+    });
+
+    const status = jobStatusFromAskResult(result);
+    await updateJob(id, {
+      status,
+      stage: status === "complete" ? "complete" : "finished_with_partial_or_error",
+      completed_at: new Date().toISOString(),
+      result,
+      partial: result?.response?.text
+        ? {
+            status: result.answer_status || result.response?.status || status,
+            text: result.response.text,
+            chars: result.response.text.length,
+            response: result.response,
+            updated_at: new Date().toISOString(),
+          }
+        : null,
+      error: result.ok ? null : { message: "ChatGPT Pro job returned a non-ok result." },
+    });
+  } catch (error) {
+    const cancelled = error?.name === "JobCancelledError";
+    await updateJob(id, {
+      status: cancelled ? "cancelled" : "failed",
+      stage: cancelled ? "cancelled" : "failed",
+      completed_at: new Date().toISOString(),
+      error: {
+        name: error?.name || "Error",
+        message: error?.message || String(error),
+        stack: process.env.CHATGPT_PRO_DEBUG ? error?.stack : undefined,
+      },
+    }).catch(() => {});
+  } finally {
+    if (lock?.acquired) {
+      await releaseBrowserLock(lock).catch(() => {});
+    }
+  }
+}
+
+async function updateJobStage(jobId, stage, detail) {
+  const patch = {
+    status: statusForStage(stage),
+    stage,
+    last_stage_detail: sanitizeJobDetail(detail),
+  };
+
+  if (detail.response?.text) {
+    patch.partial = {
+      status: detail.answer_status || detail.response.status || "streaming",
+      text: detail.response.text,
+      chars: detail.response.text.length,
+      response: detail.response,
+      updated_at: new Date().toISOString(),
+    };
+  }
+
+  await updateJob(jobId, patch);
+}
+
+function statusForStage(stage) {
+  if (stage === "selecting_model") return "selecting_model";
+  if (stage === "submitting_prompt") return "submitted";
+  if (stage === "waiting_for_response" || stage === "response_received") return "streaming";
+  return "running";
+}
+
+function jobStatusFromAskResult(result) {
+  if (!result?.ok) return "failed";
+  if (result.answer_status === "complete") return "complete";
+  if (result.answer_status === "streaming" || result.answer_status === "timeout_partial") {
+    return "timeout_partial";
+  }
+  return "complete";
+}
+
+class JobCancelledError extends Error {
+  constructor() {
+    super("ChatGPT Pro job was cancelled.");
+    this.name = "JobCancelledError";
+  }
+}
+
+async function throwIfCancelled(hooks) {
+  if (await hooks.isCancelled?.()) {
+    throw new JobCancelledError();
+  }
+}
+
+function newJobId() {
+  return `job-${new Date().toISOString().replace(/[-:.TZ]/g, "")}-${randomUUID().slice(0, 8)}`;
+}
+
+function requiredJobId(jobId) {
+  const id = String(jobId || "").trim();
+  if (!/^job-[a-z0-9-]+$/i.test(id)) {
+    throw new Error("A valid job_id is required.");
+  }
+  return id;
+}
+
+function normalizeJobName(name) {
+  const normalized = String(name || "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .slice(0, 120);
+  return normalized || undefined;
+}
+
+function jobRequestSummary(args) {
+  return {
+    job_name: normalizeJobName(args.job_name),
+    prompt_chars: args.prompt?.length || 0,
+    cdp_endpoint: args.cdp_endpoint || DEFAULT_CDP_ENDPOINT,
+    conversation_mode: args.conversation_mode || (args.session_name ? "named" : "new"),
+    session_name: normalizeSessionName(args.session_name) || undefined,
+    target_model: args.target_model || "GPT-5.5 Pro",
+    require_pro_mode: args.require_pro_mode !== false,
+    mode_selection_strategy: args.mode_selection_strategy || "auto",
+    timeout_ms: Number(args.timeout_ms || DEFAULT_JOB_TIMEOUT_MS),
+    long_prompt_strategy: args.long_prompt_strategy || "chunk",
+    max_prompt_chars: Number(args.max_prompt_chars || DEFAULT_MAX_PROMPT_CHARS),
+  };
+}
+
+function jobPath(jobId) {
+  return join(JOBS_DIR, `${requiredJobId(jobId)}.json`);
+}
+
+async function loadJob(jobId) {
+  const id = requiredJobId(jobId);
+  try {
+    return JSON.parse(await readFile(jobPath(id), "utf8"));
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      throw new Error(`No ChatGPT Pro job found for job_id=${id}.`);
+    }
+    throw error;
+  }
+}
+
+async function writeJob(job) {
+  await mkdir(JOBS_DIR, { recursive: true });
+  await writeFile(jobPath(job.id), `${JSON.stringify(job, null, 2)}\n`, "utf8");
+  return job;
+}
+
+async function updateJob(jobId, patch) {
+  const job = await loadJob(jobId);
+  const next = {
+    ...job,
+    ...patch,
+    updated_at: new Date().toISOString(),
+  };
+  await writeJob(next);
+  return next;
+}
+
+async function refreshJobLiveness(job) {
+  if (
+    job.worker_pid &&
+    !isTerminalJobStatus(job.status) &&
+    !processAlive(job.worker_pid)
+  ) {
+    return updateJob(job.id, {
+      status: "failed",
+      stage: "worker_exited",
+      completed_at: new Date().toISOString(),
+      error: {
+        message: `Worker process ${job.worker_pid} is no longer running.`,
+      },
+    });
+  }
+  return job;
+}
+
+async function markJobWorkerSpawned(jobId, pid) {
+  const job = await loadJob(jobId);
+  const patch = {
+    worker_pid: pid,
+    worker_started_at: job.worker_started_at || new Date().toISOString(),
+  };
+  if (job.status === "queued" && job.stage === "queued") {
+    patch.status = "queued";
+    patch.stage = "worker_spawned";
+  }
+  return updateJob(jobId, patch);
+}
+
+function isTerminalJobStatus(status) {
+  return ["complete", "timeout_partial", "failed", "cancelled"].includes(status);
+}
+
+function canCancelTimedOutJob(job) {
+  return (
+    job.status === "timeout_partial" &&
+    Boolean(
+      job.result?.still_running ||
+        job.result?.response?.still_running ||
+        job.partial?.response?.still_running,
+    )
+  );
+}
+
+function publicJob(job) {
+  return {
+    id: job.id,
+    name: job.name,
+    status: job.status,
+    stage: job.stage,
+    created_at: job.created_at,
+    updated_at: job.updated_at,
+    completed_at: job.completed_at,
+    worker_pid: job.worker_pid,
+    cdp_endpoint: job.cdp_endpoint,
+    lock_key: job.lock_key,
+    cancel_requested: job.cancel_requested,
+    request: job.request,
+    partial: job.partial
+      ? {
+          status: job.partial.status,
+          chars: job.partial.chars,
+          updated_at: job.partial.updated_at,
+        }
+      : null,
+    answer_status: job.result?.answer_status || job.partial?.status || undefined,
+    answer_chars: job.result?.answer?.length || job.partial?.chars || 0,
+    session: job.result?.session,
+    error: job.error,
+    last_stage_detail: job.last_stage_detail,
+  };
+}
+
+function sanitizeJobDetail(detail = {}) {
+  const sanitized = { ...detail };
+  if (sanitized.response?.text) {
+    sanitized.response = {
+      status: sanitized.response.status,
+      chars: sanitized.response.text.length,
+      still_running: sanitized.response.still_running,
+      assistant_message_count: sanitized.response.assistant_message_count,
+      stable_samples: sanitized.response.stable_samples,
+    };
+  }
+  return sanitized;
+}
+
+function endpointLockKey(endpoint) {
+  return String(endpoint || DEFAULT_CDP_ENDPOINT)
+    .replace(/^https?:\/\//, "")
+    .replace(/[^a-z0-9._-]+/gi, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 160);
+}
+
+function lockPathForEndpoint(endpoint) {
+  return join(LOCKS_DIR, `${endpointLockKey(endpoint)}.lock.json`);
+}
+
+async function readBrowserLock(endpoint) {
+  const path = lockPathForEndpoint(endpoint);
+  try {
+    const lock = JSON.parse(await readFile(path, "utf8"));
+    const stale = isStaleLock(lock);
+    if (stale) {
+      await rm(path, { force: true }).catch(() => {});
+      return { active: false, stale: lock, path };
+    }
+    return { active: true, lock, path };
+  } catch (error) {
+    if (error.code === "ENOENT") return { active: false, path };
+    throw error;
+  }
+}
+
+async function acquireBrowserLock(endpoint, jobId) {
+  await mkdir(LOCKS_DIR, { recursive: true });
+  const path = lockPathForEndpoint(endpoint);
+  const lock = {
+    job_id: jobId,
+    endpoint,
+    pid: process.pid,
+    created_at: new Date().toISOString(),
+  };
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      await writeFile(path, `${JSON.stringify(lock, null, 2)}\n`, { flag: "wx" });
+      return { acquired: true, path, lock };
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+      const active = await readBrowserLock(endpoint);
+      if (!active.active) continue;
+      return { acquired: false, path, active: active.lock };
+    }
+  }
+  return { acquired: false, path, active: null };
+}
+
+async function releaseBrowserLock(lockHandle) {
+  const existing = await readBrowserLock(lockHandle.lock.endpoint);
+  if (existing.lock?.job_id === lockHandle.lock.job_id) {
+    await rm(lockHandle.path, { force: true });
+  }
+}
+
+function isStaleLock(lock) {
+  const ageMs = Date.now() - Date.parse(lock.created_at || 0);
+  if (Number.isFinite(ageMs) && ageMs > JOB_LOCK_STALE_MS) return true;
+  if (lock.pid && !processAlive(lock.pid)) return true;
+  return false;
+}
+
+function processAlive(pid) {
+  try {
+    process.kill(Number(pid), 0);
+    return true;
+  } catch (error) {
+    return error.code === "EPERM";
+  }
+}
+
+async function stopChatGptGeneration(endpoint) {
+  const { browser, close } = await connectBrowser(endpoint);
+  try {
+    const pages = browser.contexts().flatMap((context) => context.pages())
+      .filter((page) => isChatGptAppUrl(page.url()));
+    for (const page of pages.reverse()) {
+      await page.bringToFront().catch(() => {});
+      const clicked = await clickStopGeneration(page);
+      if (clicked) {
+        return { ok: true, stopped: true, url: page.url() };
+      }
+    }
+    return { ok: true, stopped: false, detail: "No visible stop-generation button was found." };
+  } finally {
+    await close();
+  }
+}
+
+async function clickStopGeneration(page) {
+  const button = await firstVisibleEnabledLocator(page, stopButtonSelectors());
+  if (!button) return false;
+  await button.click();
+  return true;
+}
+
+function stopButtonSelectors() {
+  return [
+    '[data-testid="stop-button"]',
+    '[data-testid="composer-stop-button"]',
+    'button[aria-label="Stop"]',
+    'button[aria-label*="Stop streaming" i]',
+    'button[aria-label*="Stop generating" i]',
+    'button[aria-label*="Stop responding" i]',
+    'button[aria-label*="Cancel" i]',
+    'button[aria-label*="중지"]',
+    'button[aria-label*="취소"]',
+    'button[title*="Stop" i]',
+    'button[title*="중지"]',
+  ];
 }
 
 async function connectBrowser(endpoint = DEFAULT_CDP_ENDPOINT) {
@@ -2677,14 +3399,21 @@ function writeError(id, code, message, data) {
 
 export {
   buildPromptPlan,
+  canCancelTimedOutJob,
+  endpointLockKey,
   effortSignalCount,
   isChatGptAppUrl,
   isChatGptRelatedUrl,
   isOpenAiAuthUrl,
+  isTerminalJobStatus,
+  jobRequestSummary,
+  jobStatusFromAskResult,
   normalizeSessionName,
   scoreModeCandidate,
   selectPreferredPageCandidate,
   sendButtonSelectors,
   shouldAbortChunkResponse,
+  statusForStage,
+  stopButtonSelectors,
   splitText,
 };

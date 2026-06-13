@@ -3,13 +3,20 @@ import test from "node:test";
 
 import {
   buildPromptPlan,
+  canCancelTimedOutJob,
+  endpointLockKey,
   isChatGptAppUrl,
   isChatGptRelatedUrl,
   isOpenAiAuthUrl,
+  isTerminalJobStatus,
+  jobRequestSummary,
+  jobStatusFromAskResult,
   scoreModeCandidate,
   selectPreferredPageCandidate,
   sendButtonSelectors,
   shouldAbortChunkResponse,
+  statusForStage,
+  stopButtonSelectors,
 } from "./chatgpt-pro-mcp.mjs";
 
 test("mode scoring rejects full Korean effort menu containers as a Pro selection", () => {
@@ -110,4 +117,49 @@ test("chunk prompt planning still creates ack-only context messages", () => {
   assert.ok(plan.messages.length > 1);
   assert.match(plan.messages[0], /Reply only: ACK PART 1\//);
   assert.match(plan.messages.at(-1), /Now answer the user's request/);
+});
+
+test("job request summary omits the raw prompt and normalizes defaults", () => {
+  const summary = jobRequestSummary({
+    prompt: "secret prompt text",
+    session_name: "Code Review",
+  });
+
+  assert.equal(summary.prompt_chars, "secret prompt text".length);
+  assert.equal(summary.conversation_mode, "named");
+  assert.equal(summary.session_name, "code-review");
+  assert.equal(summary.target_model, "GPT-5.5 Pro");
+  assert.equal(Object.values(summary).includes("secret prompt text"), false);
+});
+
+test("job status helpers distinguish running, partial, and terminal states", () => {
+  assert.equal(statusForStage("selecting_model"), "selecting_model");
+  assert.equal(statusForStage("submitting_prompt"), "submitted");
+  assert.equal(statusForStage("waiting_for_response"), "streaming");
+  assert.equal(jobStatusFromAskResult({ ok: true, answer_status: "complete" }), "complete");
+  assert.equal(jobStatusFromAskResult({ ok: true, answer_status: "streaming" }), "timeout_partial");
+  assert.equal(jobStatusFromAskResult({ ok: false, answer_status: "complete" }), "failed");
+  assert.equal(isTerminalJobStatus("complete"), true);
+  assert.equal(isTerminalJobStatus("streaming"), false);
+  assert.equal(
+    canCancelTimedOutJob({
+      status: "timeout_partial",
+      result: { still_running: true },
+    }),
+    true,
+  );
+  assert.equal(canCancelTimedOutJob({ status: "timeout_partial", result: {} }), false);
+});
+
+test("endpoint lock keys are filesystem-safe and stable", () => {
+  assert.equal(endpointLockKey("http://127.0.0.1:9222"), "127.0.0.1-9222");
+  assert.equal(endpointLockKey("https://example.test:1234/devtools/browser/a"), "example.test-1234-devtools-browser-a");
+});
+
+test("stop generation selectors are explicit and do not use generic SVG fallback", () => {
+  const selectors = stopButtonSelectors();
+
+  assert.ok(selectors.some((selector) => selector.includes("stop-button")));
+  assert.ok(selectors.some((selector) => selector.includes("aria-label")));
+  assert.equal(selectors.some((selector) => selector === "button:has(svg)"), false);
 });

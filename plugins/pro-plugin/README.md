@@ -93,6 +93,10 @@ Do not expose the debugging port to an untrusted network. CDP can control the br
 - `install_comet_cdp_launchagent`: installs a macOS per-user LaunchAgent so Comet starts with CDP enabled while reusing the existing profile.
 - `restart_comet_cdp_launchagent`: gracefully quits Comet and kickstarts the installed LaunchAgent so Comet reopens with CDP enabled.
 - `ask_chatgpt_pro`: opens ChatGPT, tries to select Pro mode, submits a prompt, waits for the answer to stabilize, and returns the final text. It uses a mode-selection adapter: `auto` first tries strict DOM/coordinate selection of a short Pro leaf row, verifies that Pro is actually selected, then falls back to the legacy DOM strategy.
+- `start_chatgpt_pro_job`: starts the same Pro request in a detached worker process and returns a persistent `job_id` immediately. Use this for Pro requests that may take many minutes.
+- `chatgpt_pro_job_status`: reads persisted job state such as `queued`, `selecting_model`, `submitted`, `streaming`, `complete`, `timeout_partial`, `failed`, or `cancelled`.
+- `read_chatgpt_pro_job_result`: returns the final answer, or the latest partial response while the job is still running.
+- `cancel_chatgpt_pro_job`: marks the job for cancellation and tries to click the visible stop-generation control in ChatGPT.
 - `read_chatgpt_pro_response`: reads or waits for the latest assistant response in the current/named ChatGPT conversation without submitting a new prompt. This tool is read-only: it does not create a new ChatGPT tab or navigate to a saved session URL.
 
 Useful `ask_chatgpt_pro` options:
@@ -105,6 +109,15 @@ Useful `ask_chatgpt_pro` options:
 - `max_prompt_chars`: single-message character budget before chunking.
 
 `ask_chatgpt_pro` returns `answer_status` and `response`. Possible statuses include `complete`, `streaming`, and `timeout_partial`. If a response is still streaming or Codex was interrupted, use `read_chatgpt_pro_response` instead of sending a "continue" prompt; this avoids polluting the ChatGPT conversation while the original answer is still being generated. For chunked prompts, the tool stops before sending the next chunk if the previous chunk has not completed cleanly.
+
+For long Pro runs, prefer the job flow:
+
+1. Call `start_chatgpt_pro_job` and keep the returned `job_id`.
+2. Poll `chatgpt_pro_job_status` periodically.
+3. Call `read_chatgpt_pro_job_result` for partial or final text.
+4. Call `cancel_chatgpt_pro_job` if the browser generation should be stopped.
+
+Jobs are stored under `~/.cache/pro-plugin/jobs`. The raw prompt is stored locally so the detached worker can run even if the Codex tool call returns; tool responses only expose prompt length and job metadata. The plugin also creates a per-CDP-endpoint lock under `~/.cache/pro-plugin/locks` so two background jobs do not manipulate the same ChatGPT browser at the same time.
 
 Recommended result format in Codex:
 

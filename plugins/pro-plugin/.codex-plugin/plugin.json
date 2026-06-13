@@ -1,6 +1,6 @@
 {
   "name": "pro-plugin",
-  "version": "0.1.0+codex.20260613120435",
+  "version": "0.1.0+codex.20260613123128",
   "description": "Consult ChatGPT web Pro mode from Codex through a user-owned browser session.",
   "author": {
     "name": "xavier"
