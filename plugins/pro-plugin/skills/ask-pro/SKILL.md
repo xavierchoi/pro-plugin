@@ -9,7 +9,7 @@ Use the `ask_chatgpt_pro` MCP tool when the user explicitly asks for ChatGPT Pro
 
 Before calling `ask_chatgpt_pro`, make sure the user has a Chrome, Comet, or other Chromium-based browser instance running with remote debugging enabled and already logged into `https://chatgpt.com`.
 
-If the user asks to set up the browser, connect ChatGPT Pro, prepare Comet, or otherwise wants the setup handled inside Codex, call `setup_chatgpt_pro_browser` first. Use the default profile mode unless the user asks for an isolated profile; the default mode tries to reuse the user's existing Comet/Chrome profile so onboarding and ChatGPT login carry over.
+If the user asks to set up the browser, connect ChatGPT Pro, prepare Comet, or otherwise wants the setup handled inside Codex, call `setup_chatgpt_pro_browser` first. Use the default profile mode unless the user asks for an isolated profile; the default mode tries to reuse the user's existing Comet/Chrome profile so onboarding and ChatGPT login carry over. When CDP is already reachable, setup should still focus or open a ChatGPT/OpenAI auth tab through CDP before status is checked.
 
 If default-profile Comet launches but CDP is not ready, do not immediately switch to a dedicated profile. First call `install_comet_cdp_launchagent` so future Comet launches use the existing profile with `--remote-debugging-port`. If Comet was already running, explain that Chromium cannot add CDP to an already-running profile; the user may need to quit and reopen Comet once, or wait for the next login. If the user wants Codex to handle that restart, call `restart_comet_cdp_launchagent`, which gracefully asks macOS to quit Comet and then kickstarts the installed LaunchAgent. Use a dedicated profile only when the user accepts separate onboarding/login or needs an immediate isolated fallback.
 
@@ -58,7 +58,7 @@ When using the tool:
 - Use `mode_selection_strategy: "skip"` only after the user confirms they manually selected Pro in the browser.
 - Keep `long_prompt_strategy: "chunk"` for large diffs or logs unless the user explicitly wants fail-fast behavior.
 - Include enough context in the prompt because the web conversation is separate from the Codex thread.
-- If `ask_chatgpt_pro` returns `answer_status: "streaming"` or `answer_status: "timeout_partial"`, or if the Codex tool call is interrupted while ChatGPT may still be generating, do not send a follow-up "continue" prompt immediately. Call `read_chatgpt_pro_response` to wait for and read the latest assistant response without submitting new text.
+- If `ask_chatgpt_pro` returns `answer_status: "streaming"` or `answer_status: "timeout_partial"`, or if the Codex tool call is interrupted while ChatGPT may still be generating, do not send a follow-up "continue" prompt immediately. Call `read_chatgpt_pro_response` to wait for and read the latest assistant response without submitting new text. `read_chatgpt_pro_response` is read-only; it will not create a missing ChatGPT tab or navigate to a saved session URL, so use the current open ChatGPT tab or ask the user to open the saved session URL first.
 - Treat the returned answer as a second opinion, not as an authoritative source for current facts unless it cites verifiable sources.
 - Do not kill the running MCP server process from the same Codex thread to force a plugin reload. If plugin code was upgraded, ask the user to start a new Codex thread or reinstall/upgrade the plugin outside the active tool call path.
 

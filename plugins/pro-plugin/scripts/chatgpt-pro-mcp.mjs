@@ -5,7 +5,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const DEFAULT_CDP_ENDPOINT =
@@ -283,37 +283,47 @@ const tools = [
   },
 ];
 
-const rl = createInterface({
-  input: process.stdin,
-  output: process.stdout,
-  terminal: false,
-});
+if (isDirectRun()) {
+  startServer();
+}
 
-rl.on("line", async (line) => {
-  if (!line.trim()) return;
+function startServer() {
+  const rl = createInterface({
+    input: process.stdin,
+    output: process.stdout,
+    terminal: false,
+  });
 
-  let message;
-  try {
-    message = JSON.parse(line);
-  } catch (error) {
-    writeError(null, -32700, `Invalid JSON: ${error.message}`);
-    return;
-  }
+  rl.on("line", async (line) => {
+    if (!line.trim()) return;
 
-  if (!Object.prototype.hasOwnProperty.call(message, "id")) {
-    return;
-  }
+    let message;
+    try {
+      message = JSON.parse(line);
+    } catch (error) {
+      writeError(null, -32700, `Invalid JSON: ${error.message}`);
+      return;
+    }
 
-  try {
-    const result = await dispatch(message.method, message.params || {});
-    write({ jsonrpc: "2.0", id: message.id, result });
-  } catch (error) {
-    writeError(message.id, -32000, error.message, {
-      name: error.name,
-      stack: process.env.CHATGPT_PRO_DEBUG ? error.stack : undefined,
-    });
-  }
-});
+    if (!Object.prototype.hasOwnProperty.call(message, "id")) {
+      return;
+    }
+
+    try {
+      const result = await dispatch(message.method, message.params || {});
+      write({ jsonrpc: "2.0", id: message.id, result });
+    } catch (error) {
+      writeError(message.id, -32000, error.message, {
+        name: error.name,
+        stack: process.env.CHATGPT_PRO_DEBUG ? error.stack : undefined,
+      });
+    }
+  });
+}
+
+function isDirectRun() {
+  return Boolean(process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url));
+}
 
 async function dispatch(method, params) {
   if (method === "initialize") {
@@ -370,17 +380,31 @@ async function setupBrowser(args) {
 
   const existing = await probeCdp(endpoint);
   if (existing.ok) {
+    const pageReady = await ensureCdpPage(endpoint, openUrl).catch((error) => ({
+      ok: false,
+      error: error.message,
+    }));
     return JSON.stringify(
       {
         ok: true,
         already_running: true,
         endpoint,
         browser: existing.version?.Browser || existing.version,
-        next_steps: [
-          "Open or focus the ChatGPT tab in the CDP-enabled browser.",
-          "Complete ChatGPT login and 2FA manually if prompted.",
-          "Run chatgpt_pro_status, then ask_chatgpt_pro.",
-        ],
+        open_url: openUrl,
+        open_url_ready: pageReady.ok,
+        page: pageReady.page || null,
+        page_action: pageReady.action || null,
+        open_url_error: pageReady.error || undefined,
+        next_steps: pageReady.ok
+          ? [
+              "Complete ChatGPT login and 2FA manually if prompted.",
+              "Run chatgpt_pro_status, then ask_chatgpt_pro.",
+            ]
+          : [
+              "CDP is reachable, but the requested ChatGPT tab could not be opened automatically.",
+              `Open ${openUrl} manually in the CDP-enabled browser.`,
+              "Run chatgpt_pro_status, then ask_chatgpt_pro.",
+            ],
       },
       null,
       2,
@@ -427,6 +451,12 @@ async function setupBrowser(args) {
   child.unref();
 
   const ready = await waitForCdp(endpoint, 10000);
+  const pageReady = ready.ok
+    ? await ensureCdpPage(endpoint, openUrl).catch((error) => ({
+        ok: false,
+        error: error.message,
+      }))
+    : null;
   return JSON.stringify(
     {
       ok: ready.ok,
@@ -443,6 +473,11 @@ async function setupBrowser(args) {
           : "Dedicated profile mode isolates this workflow but may require separate onboarding and login.",
       pid: child.pid,
       cdp_ready: ready.ok,
+      open_url: openUrl,
+      open_url_ready: Boolean(pageReady?.ok),
+      page: pageReady?.page || null,
+      page_action: pageReady?.action || null,
+      open_url_error: pageReady?.error || undefined,
       browser_version: ready.version?.Browser || ready.version || null,
       next_steps: browserSetupNextSteps(ready.ok, profile.mode, endpoint, selection.kind),
     },
@@ -521,13 +556,22 @@ async function installCometLaunchAgent(args) {
   const after = await waitForCdp(endpoint, args.load_now === false ? 500 : 4000);
   const hadCdp = existing.ok;
   const hasCdp = after.ok;
+  const loaded =
+    args.load_now !== false &&
+    loadResults
+      .filter((result) => !result.command.includes(" bootout "))
+      .every((result) => result.ok);
 
   return JSON.stringify(
     {
       ok: true,
+      installed: true,
+      loaded,
+      setup_complete: hasCdp,
       endpoint,
       cdp_ready: hasCdp,
       already_had_cdp: hadCdp,
+      requires_browser_restart: !hasCdp && args.load_now !== false,
       plist_path: plistPath,
       label,
       executable: selection.executable,
@@ -692,23 +736,28 @@ async function status(args) {
       version = "";
     }
     const pages = browser.contexts().flatMap((context) => context.pages());
-    const chatgptPages = pages
-      .filter((page) => page.url().includes("chatgpt.com"));
+    const chatgptPages = pages.filter((page) => isChatGptAppUrl(page.url()));
+    const authPages = pages.filter((page) => isOpenAiAuthUrl(page.url()));
+    const relatedPages = [...chatgptPages, ...authPages];
 
     diagnostics.browser_version = version;
     diagnostics.page_count = pages.length;
     diagnostics.chatgpt_pages = chatgptPages.map((page) => page.url());
+    diagnostics.auth_pages = authPages.map((page) => page.url());
+    diagnostics.bridge_ok = true;
     diagnostics.checks.push({
       name: "chatgpt_tab",
-      ok: chatgptPages.length > 0,
+      ok: relatedPages.length > 0,
       detail:
         chatgptPages.length > 0
           ? `Found ${chatgptPages.length} ChatGPT tab(s).`
-          : "No ChatGPT tab is open yet.",
+          : authPages.length > 0
+            ? `Found ${authPages.length} OpenAI auth tab(s); login or 2FA is still in progress.`
+            : "No ChatGPT tab is open yet.",
     });
 
     if (args.include_page_diagnostics !== false && chatgptPages[0]) {
-      const page = chatgptPages[0];
+      const page = (await preferredChatGptPage(chatgptPages)) || chatgptPages[0];
       await page.bringToFront().catch(() => {});
       const composer = await findComposer(page);
       const modelHints = await visibleModelHints(page);
@@ -728,9 +777,19 @@ async function status(args) {
             : "No visible model/mode hints found.",
       });
       diagnostics.model_hints = modelHints;
+    } else if (args.include_page_diagnostics !== false && authPages[0]) {
+      await authPages[0].bringToFront().catch(() => {});
+      diagnostics.checks.push({
+        name: "chatgpt_login",
+        ok: false,
+        detail: "OpenAI auth page is visible; complete password/2FA in the browser.",
+      });
     }
 
     diagnostics.ok = diagnostics.checks.every((check) => check.ok);
+    diagnostics.pro_ready =
+      diagnostics.checks.find((check) => check.name === "chatgpt_login")?.ok === true &&
+      diagnostics.checks.find((check) => check.name === "pro_mode_hint")?.ok === true;
   } catch (error) {
     diagnostics.checks.push({
       name: "cdp_endpoint",
@@ -757,7 +816,7 @@ async function status(args) {
     false
   ) {
     diagnostics.next_steps.push(
-      "Open https://chatgpt.com in the CDP-enabled browser.",
+      "Run setup_chatgpt_pro_browser to open https://chatgpt.com in the CDP-enabled browser.",
     );
   }
 
@@ -823,6 +882,28 @@ async function askChatGptPro(args) {
         timeoutMs,
         requireNewMessage: true,
       });
+      if (shouldAbortChunkResponse(index, promptPlan.messages.length, response)) {
+        return JSON.stringify(
+          {
+            ok: false,
+            pro_mode: proSelection,
+            session: sessionName
+              ? { name: sessionName, url: page.url() }
+              : undefined,
+            prompt_plan: promptPlan.summary,
+            interrupted_at_message: index + 1,
+            answer_status: response.status,
+            still_running: response.still_running,
+            response,
+            next_steps: [
+              "The previous context chunk did not finish cleanly, so the plugin did not submit the next chunk.",
+              "Use read_chatgpt_pro_response with wait_for_completion=true to collect the current response before retrying.",
+            ],
+          },
+          null,
+          2,
+        );
+      }
       if (index === promptPlan.messages.length - 1) {
         answer = response.text;
         answerResponse = response;
@@ -861,7 +942,7 @@ async function readChatGptProResponse(args) {
   const { browser, close } = await connectBrowser(args.cdp_endpoint);
 
   try {
-    const page = await getChatGptPage(browser, conversationMode, sessionName);
+    const page = await getReadableChatGptPage(browser, conversationMode, sessionName);
     page.setDefaultTimeout(Math.min(timeoutMs, 60000));
 
     const response = args.wait_for_completion === false
@@ -949,15 +1030,14 @@ async function loadPlaywrightCore() {
 
 async function getChatGptPage(browser, conversationMode, sessionName) {
   const context = browser.contexts()[0] || (await browser.newContext());
-  const pages = context.pages();
-  const existing = pages.find((page) => page.url().includes("chatgpt.com"));
+  const candidates = await chatGptPageCandidates(context);
 
   if (conversationMode === "named" && sessionName) {
     const saved = await loadNamedSession(sessionName);
     const matching = saved
-      ? pages.find((page) => normalizeUrl(page.url()) === normalizeUrl(saved.url))
+      ? selectPreferredPageCandidate(candidates, { savedUrl: saved.url })
       : null;
-    const page = matching || existing || (await context.newPage());
+    const page = matching?.page || (await context.newPage());
     await page.bringToFront();
     if (saved?.url) {
       await page.goto(saved.url, { waitUntil: "domcontentloaded" });
@@ -968,12 +1048,15 @@ async function getChatGptPage(browser, conversationMode, sessionName) {
     return page;
   }
 
-  if (conversationMode === "current" && existing) {
-    await existing.bringToFront();
-    return existing;
+  if (conversationMode === "current") {
+    const current = selectPreferredPageCandidate(candidates);
+    if (current) {
+      await current.page.bringToFront();
+      return current.page;
+    }
   }
 
-  const page = existing || (await context.newPage());
+  const page = await context.newPage();
   await page.bringToFront();
   await page.goto(CHATGPT_URL, { waitUntil: "domcontentloaded" });
 
@@ -982,6 +1065,78 @@ async function getChatGptPage(browser, conversationMode, sessionName) {
   }
 
   return page;
+}
+
+async function getReadableChatGptPage(browser, conversationMode, sessionName) {
+  const context = browser.contexts()[0] || (await browser.newContext());
+  const candidates = await chatGptPageCandidates(context);
+
+  if (conversationMode === "named") {
+    if (!sessionName) {
+      throw new Error("session_name is required when conversation_mode=named.");
+    }
+    const saved = await loadNamedSession(sessionName);
+    if (!saved?.url) {
+      throw new Error(
+        `No saved ChatGPT session named "${sessionName}" exists. Ask with conversation_mode=named first, or read from conversation_mode=current.`,
+      );
+    }
+    const matching = selectPreferredPageCandidate(candidates, { savedUrl: saved.url });
+    if (!matching) {
+      throw new Error(
+        `Saved ChatGPT session "${sessionName}" is not currently open in the CDP browser. Open ${saved.url} in the browser, then retry read_chatgpt_pro_response.`,
+      );
+    }
+    await matching.page.bringToFront();
+    return matching.page;
+  }
+
+  const current = selectPreferredPageCandidate(candidates);
+  if (!current) {
+    throw new Error(
+      "No open ChatGPT conversation was found to read. Open or focus a ChatGPT tab first; read_chatgpt_pro_response will not create a new conversation.",
+    );
+  }
+  await current.page.bringToFront();
+  return current.page;
+}
+
+async function chatGptPageCandidates(context) {
+  const pages = context.pages().filter((page) => isChatGptAppUrl(page.url()));
+  const candidates = [];
+  for (const [index, page] of pages.entries()) {
+    candidates.push({
+      page,
+      index,
+      url: page.url(),
+      visibility_state: await page
+        .evaluate(() => document.visibilityState)
+        .catch(() => ""),
+    });
+  }
+  return candidates;
+}
+
+async function preferredChatGptPage(pages) {
+  const fakeContext = {
+    pages: () => pages,
+  };
+  return selectPreferredPageCandidate(await chatGptPageCandidates(fakeContext))?.page || null;
+}
+
+function selectPreferredPageCandidate(candidates, { savedUrl } = {}) {
+  if (savedUrl) {
+    const normalizedSaved = normalizeUrl(savedUrl);
+    const exact = candidates
+      .filter((candidate) => normalizeUrl(candidate.url) === normalizedSaved)
+      .at(-1);
+    if (exact) return exact;
+  }
+
+  const visible = candidates
+    .filter((candidate) => candidate.visibility_state === "visible")
+    .at(-1);
+  return visible || candidates.at(-1) || null;
 }
 
 async function openNewChat(page) {
@@ -1780,22 +1935,66 @@ async function submitPrompt(page, prompt) {
     throw new Error("Cannot submit prompt because the ChatGPT composer is missing.");
   }
 
+  const beforeUserCount = await userMessageCount(page);
   await composer.click();
   await page.keyboard.press(process.platform === "darwin" ? "Meta+A" : "Control+A");
   await page.keyboard.insertText(prompt);
   await page.waitForTimeout(300);
 
-  const sendButton = await firstVisibleLocator(page, [
-    '[data-testid="send-button"]',
-    'button[aria-label*="Send" i]',
-    'button:has(svg)',
-  ]);
+  const sendButton = await firstVisibleEnabledLocator(page, sendButtonSelectors());
 
   if (sendButton) {
     await sendButton.click();
   } else {
     await page.keyboard.press("Enter");
   }
+
+  let submitted = await waitForPromptSubmitted(page, beforeUserCount, 10000);
+  if (!submitted && sendButton) {
+    await page.keyboard.press("Enter");
+    submitted = await waitForPromptSubmitted(page, beforeUserCount, 5000);
+  }
+
+  if (!submitted) {
+    throw new Error(
+      "Prompt did not appear to submit. The send button may be disabled or ChatGPT UI changed; no fallback UI button was clicked.",
+    );
+  }
+}
+
+function sendButtonSelectors() {
+  return [
+    '[data-testid="send-button"]',
+    '[data-testid="composer-submit-button"]',
+    'button[aria-label="Send prompt"]',
+    'button[aria-label="Send message"]',
+    'button[aria-label*="Send" i]',
+    'button[aria-label*="보내"]',
+    'button[title*="Send" i]',
+    'button[title*="보내"]',
+  ];
+}
+
+async function waitForPromptSubmitted(page, beforeUserCount, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if ((await userMessageCount(page)) > beforeUserCount) return true;
+    if (await composerLooksEmpty(page)) return true;
+    await page.waitForTimeout(300);
+  }
+  return false;
+}
+
+async function composerLooksEmpty(page) {
+  const composer = await findComposer(page);
+  if (!composer) return false;
+  const text = await composer
+    .evaluate((node) => {
+      if ("value" in node) return node.value || "";
+      return node.innerText || node.textContent || "";
+    })
+    .catch(() => "");
+  return text.trim().length === 0;
 }
 
 async function waitForAssistantResponse(
@@ -1869,6 +2068,13 @@ async function assistantMessageCount(page) {
   });
 }
 
+async function userMessageCount(page) {
+  return page.evaluate(() => {
+    const nodes = document.querySelectorAll('[data-message-author-role="user"]');
+    return nodes.length;
+  });
+}
+
 async function lastAssistantText(page) {
   return page.evaluate(() => {
     const candidates = Array.from(
@@ -1881,42 +2087,36 @@ async function lastAssistantText(page) {
 
 async function responseStillRunning(page) {
   return page.evaluate(() => {
-    const labels = [
-      "Stop streaming",
-      "Stop generating",
-      "Stop responding",
-      "Cancel",
-      "중지",
-      "생성 중지",
-      "응답 중지",
-      "취소",
+    const labelPatterns = [
+      /stop\s+(streaming|generating|responding)/i,
+      /^stop$/i,
+      /^cancel$/i,
+      /생성\s*중지/,
+      /응답\s*중지/,
+      /^중지$/,
+      /^취소$/,
     ];
+    const testIdPattern = /(stop|cancel).*(button|generat|respond)|composer-stop/i;
     const buttons = Array.from(document.querySelectorAll("button"));
-    if (
-      labels.some((label) =>
-        buttons.some((button) =>
-          (button.getAttribute("aria-label") || button.innerText || "")
-            .toLowerCase()
-            .includes(label.toLowerCase()),
-        ),
-      )
-    ) {
-      return true;
-    }
-
     return buttons.some((button) => {
-      const label = `${button.getAttribute("aria-label") || ""} ${button.innerText || ""}`.trim();
       const rect = button.getBoundingClientRect();
-      const visible = rect.width > 0 && rect.height > 0;
-      const looksLikeStop =
-        visible &&
-        rect.width <= 80 &&
-        rect.height <= 80 &&
-        (button.querySelector('svg rect, svg [d*="M6"], svg [d*="m6"]') ||
-          /stop|중지/i.test(label));
-      return Boolean(looksLikeStop);
+      if (rect.width <= 0 || rect.height <= 0) return false;
+      const label = [
+        button.getAttribute("aria-label"),
+        button.getAttribute("title"),
+        button.innerText,
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .trim();
+      const testId = button.getAttribute("data-testid") || "";
+      return labelPatterns.some((pattern) => pattern.test(label)) || testIdPattern.test(testId);
     });
   });
+}
+
+function shouldAbortChunkResponse(index, totalMessages, response) {
+  return index < totalMessages - 1 && response?.status !== "complete";
 }
 
 async function visibleModelHints(page) {
@@ -1985,6 +2185,17 @@ async function firstVisibleLocator(page, selectors) {
   for (const selector of selectors) {
     const locator = page.locator(selector).first();
     if (await isVisible(locator, 1000)) {
+      return locator;
+    }
+  }
+  return null;
+}
+
+async function firstVisibleEnabledLocator(page, selectors) {
+  for (const selector of selectors) {
+    const locator = page.locator(selector).first();
+    if (!(await isVisible(locator, 1000))) continue;
+    if (await locator.isEnabled().catch(() => false)) {
       return locator;
     }
   }
@@ -2347,6 +2558,87 @@ async function probeCdp(endpoint) {
   }
 }
 
+async function ensureCdpPage(endpoint, url) {
+  const pages = await listCdpPages(endpoint);
+  const existing = pages.find((page) =>
+    isChatGptRelatedUrl(url) ? isChatGptRelatedUrl(page.url) : normalizeUrl(page.url) === normalizeUrl(url),
+  );
+  if (existing?.id) {
+    await activateCdpPage(endpoint, existing.id).catch(() => {});
+    return {
+      ok: true,
+      action: "focused_existing",
+      page: cdpPageSummary(existing),
+    };
+  }
+
+  const base = endpoint.replace(/\/$/, "");
+  const response = await fetch(`${base}/json/new?${encodeURIComponent(url)}`, {
+    method: "PUT",
+  });
+  if (!response.ok) {
+    throw new Error(`CDP /json/new failed with HTTP ${response.status}`);
+  }
+  const page = await response.json();
+  if (page?.id) {
+    await activateCdpPage(endpoint, page.id).catch(() => {});
+  }
+  return {
+    ok: true,
+    action: "opened_new",
+    page: cdpPageSummary(page),
+  };
+}
+
+async function listCdpPages(endpoint) {
+  const response = await fetch(`${endpoint.replace(/\/$/, "")}/json/list`);
+  if (!response.ok) {
+    throw new Error(`CDP /json/list failed with HTTP ${response.status}`);
+  }
+  const pages = await response.json();
+  return Array.isArray(pages) ? pages : [];
+}
+
+async function activateCdpPage(endpoint, id) {
+  const response = await fetch(`${endpoint.replace(/\/$/, "")}/json/activate/${id}`);
+  if (!response.ok) {
+    throw new Error(`CDP /json/activate failed with HTTP ${response.status}`);
+  }
+}
+
+function cdpPageSummary(page) {
+  return page
+    ? {
+        id: page.id,
+        title: page.title,
+        url: page.url,
+        type: page.type,
+      }
+    : null;
+}
+
+function isChatGptAppUrl(url) {
+  try {
+    const parsed = new URL(url);
+    return parsed.hostname === "chatgpt.com" || parsed.hostname.endsWith(".chatgpt.com");
+  } catch {
+    return false;
+  }
+}
+
+function isOpenAiAuthUrl(url) {
+  try {
+    const parsed = new URL(url);
+    return parsed.hostname === "auth.openai.com";
+  } catch {
+    return false;
+  }
+}
+
+function isChatGptRelatedUrl(url) {
+  return isChatGptAppUrl(url) || isOpenAiAuthUrl(url);
+}
+
 async function isVisible(locator, timeout) {
   try {
     await locator.waitFor({ state: "visible", timeout });
@@ -2382,3 +2674,17 @@ function writeError(id, code, message, data) {
     },
   });
 }
+
+export {
+  buildPromptPlan,
+  effortSignalCount,
+  isChatGptAppUrl,
+  isChatGptRelatedUrl,
+  isOpenAiAuthUrl,
+  normalizeSessionName,
+  scoreModeCandidate,
+  selectPreferredPageCandidate,
+  sendButtonSelectors,
+  shouldAbortChunkResponse,
+  splitText,
+};

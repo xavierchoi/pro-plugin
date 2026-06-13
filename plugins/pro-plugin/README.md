@@ -16,7 +16,7 @@ In a Codex thread, ask:
 ChatGPT Pro browser setup을 해줘.
 ```
 
-Codex should call `setup_chatgpt_pro_browser`, which starts Comet or Chrome with CDP enabled and opens ChatGPT. By default it tries to reuse your existing browser profile so ChatGPT login and Comet onboarding are preserved. Complete login and 2FA manually in the browser window if prompted, then ask Codex to check status.
+Codex should call `setup_chatgpt_pro_browser`, which starts Comet or Chrome with CDP enabled and opens ChatGPT. If a CDP browser is already running, the tool focuses an existing ChatGPT/OpenAI auth tab or opens one through CDP instead of asking you to do it manually. By default it tries to reuse your existing browser profile so ChatGPT login and Comet onboarding are preserved. Complete login and 2FA manually in the browser window if prompted, then ask Codex to check status.
 
 If Comet is already running with your normal profile, Chromium may reuse the existing process and ignore newly supplied CDP flags. In that case, ask Codex:
 
@@ -89,11 +89,11 @@ Do not expose the debugging port to an untrusted network. CDP can control the br
 ## Tools
 
 - `setup_chatgpt_pro_browser`: starts or verifies a local Comet/Chrome CDP browser and opens ChatGPT.
-- `chatgpt_pro_status`: checks CDP reachability, SSH/tunnel hints, ChatGPT tab visibility, login/composer state, and visible model hints.
+- `chatgpt_pro_status`: checks CDP reachability, SSH/tunnel hints, ChatGPT tab or OpenAI auth visibility, login/composer state, and visible model hints.
 - `install_comet_cdp_launchagent`: installs a macOS per-user LaunchAgent so Comet starts with CDP enabled while reusing the existing profile.
 - `restart_comet_cdp_launchagent`: gracefully quits Comet and kickstarts the installed LaunchAgent so Comet reopens with CDP enabled.
 - `ask_chatgpt_pro`: opens ChatGPT, tries to select Pro mode, submits a prompt, waits for the answer to stabilize, and returns the final text. It uses a mode-selection adapter: `auto` first tries strict DOM/coordinate selection of a short Pro leaf row, verifies that Pro is actually selected, then falls back to the legacy DOM strategy.
-- `read_chatgpt_pro_response`: reads or waits for the latest assistant response in the current/named ChatGPT conversation without submitting a new prompt.
+- `read_chatgpt_pro_response`: reads or waits for the latest assistant response in the current/named ChatGPT conversation without submitting a new prompt. This tool is read-only: it does not create a new ChatGPT tab or navigate to a saved session URL.
 
 Useful `ask_chatgpt_pro` options:
 
@@ -104,7 +104,7 @@ Useful `ask_chatgpt_pro` options:
 - `long_prompt_strategy`: `chunk`, `fail`, or `truncate`; default `chunk`.
 - `max_prompt_chars`: single-message character budget before chunking.
 
-`ask_chatgpt_pro` returns `answer_status` and `response`. Possible statuses include `complete`, `streaming`, and `timeout_partial`. If a response is still streaming or Codex was interrupted, use `read_chatgpt_pro_response` instead of sending a "continue" prompt; this avoids polluting the ChatGPT conversation while the original answer is still being generated.
+`ask_chatgpt_pro` returns `answer_status` and `response`. Possible statuses include `complete`, `streaming`, and `timeout_partial`. If a response is still streaming or Codex was interrupted, use `read_chatgpt_pro_response` instead of sending a "continue" prompt; this avoids polluting the ChatGPT conversation while the original answer is still being generated. For chunked prompts, the tool stops before sending the next chunk if the previous chunk has not completed cleanly.
 
 Recommended result format in Codex:
 
