@@ -92,11 +92,12 @@ Do not expose the debugging port to an untrusted network. CDP can control the br
 - `chatgpt_pro_status`: checks CDP reachability, SSH/tunnel hints, ChatGPT tab visibility, login/composer state, and visible model hints.
 - `install_comet_cdp_launchagent`: installs a macOS per-user LaunchAgent so Comet starts with CDP enabled while reusing the existing profile.
 - `restart_comet_cdp_launchagent`: gracefully quits Comet and kickstarts the installed LaunchAgent so Comet reopens with CDP enabled.
-- `ask_chatgpt_pro`: opens ChatGPT, tries to select Pro mode, submits a prompt, waits for the answer to stabilize, and returns the final text. It opens the model/effort menu and scores visible clickable options, preferring Pro-like options while rejecting non-Pro efforts such as instant/medium/high.
+- `ask_chatgpt_pro`: opens ChatGPT, tries to select Pro mode, submits a prompt, waits for the answer to stabilize, and returns the final text. It uses a mode-selection adapter: `auto` first tries strict DOM/coordinate selection of a short Pro leaf row, verifies that Pro is actually selected, then falls back to the legacy DOM strategy.
 
 Useful `ask_chatgpt_pro` options:
 
 - `target_model`: visible label to select, default `GPT-5.5 Pro`; the selector treats Pro as a mode/effort choice because ChatGPT may expose Pro separately from the model name.
+- `mode_selection_strategy`: `auto`, `strict-dom`, `legacy-dom`, or `skip`; default `auto`. Use `skip` only when you have manually selected Pro in the browser and want the tool to submit without changing the menu.
 - `session_name`: saves and reuses a ChatGPT conversation URL for follow-up questions.
 - `conversation_mode`: `new`, `current`, or `named`.
 - `long_prompt_strategy`: `chunk`, `fail`, or `truncate`; default `chunk`.
@@ -111,5 +112,7 @@ Recommended result format in Codex:
 ## Notes
 
 This is a browser automation bridge, not a native Codex model provider. It is intentionally heuristic because chatgpt.com UI labels and DOM structure can change.
+
+The mode-selection path is intentionally isolated behind `mode_selection_strategy` so a future Browser Agent sidecar, such as Playwright MCP, Stagehand, or browser-use, can replace only the selection adapter without changing prompt submission and response collection.
 
 Do not kill the active MCP server process from the same Codex thread to force plugin reloads; that can close the tool transport. Upgrade or reinstall the plugin, then start a new Codex thread.

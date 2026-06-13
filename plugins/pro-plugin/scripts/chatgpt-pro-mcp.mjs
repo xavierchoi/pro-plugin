@@ -206,6 +206,13 @@ const tools = [
           description:
             "Fail if the tool cannot confidently select a Pro mode control.",
         },
+        mode_selection_strategy: {
+          type: "string",
+          enum: ["auto", "strict-dom", "legacy-dom", "skip"],
+          default: "auto",
+          description:
+            "How to select ChatGPT Pro effort. auto tries strict DOM/coordinate selection before legacy DOM fallback; skip assumes the visible browser state is already correct.",
+        },
         timeout_ms: {
           type: "integer",
           minimum: 30000,
@@ -747,7 +754,9 @@ async function askChatGptPro(args) {
       );
     }
 
-    const proSelection = await selectProMode(page, args.target_model || "GPT-5.5 Pro");
+    const proSelection = await selectProMode(page, args.target_model || "GPT-5.5 Pro", {
+      strategy: args.mode_selection_strategy || "auto",
+    });
     if (!proSelection.selected && requireProMode) {
       throw new Error(
         `Could not confidently select Pro mode: ${proSelection.reason}. Visible candidates: ${JSON.stringify(proSelection.visible_menu_candidates || [])}. Set require_pro_mode=false for a best-effort call.`,
@@ -942,13 +951,116 @@ async function findComposer(page) {
   return null;
 }
 
-async function selectProMode(page, targetModel = "GPT-5.5 Pro") {
+async function selectProMode(page, targetModel = "GPT-5.5 Pro", options = {}) {
+  const strategy = options.strategy || "auto";
+  if (strategy === "skip") {
+    const hints = await visibleModelHints(page);
+    const proHint = hints.find((hint) => /\bPro\b/i.test(hint) || /프로/.test(hint));
+    return {
+      selected: Boolean(proHint),
+      target_model: targetModel,
+      strategy,
+      reason: proHint
+        ? `Selection skipped; visible composer hint looks Pro-like: ${proHint}`
+        : "Selection skipped, but no Pro-like composer hint was visible.",
+      visible_menu_candidates: hints.map((hint) => ({ text: hint, source: "composer-visible-hint" })),
+    };
+  }
+
+  if (strategy === "auto" || strategy === "strict-dom") {
+    const strict = await selectProModeStrictDom(page, targetModel);
+    if (strict.selected || strategy === "strict-dom") return strict;
+  }
+
+  if (strategy === "auto" || strategy === "legacy-dom") {
+    const legacy = await selectProModeLegacyDom(page, targetModel);
+    return {
+      ...legacy,
+      strategy: strategy === "auto" ? "auto:legacy-dom" : "legacy-dom",
+    };
+  }
+
+  return {
+    selected: false,
+    target_model: targetModel,
+    strategy,
+    reason: `Unknown mode_selection_strategy: ${strategy}`,
+    visible_menu_candidates: [],
+  };
+}
+
+async function selectProModeStrictDom(page, targetModel = "GPT-5.5 Pro") {
+  const attempts = [];
+  for (const picker of await pickerCandidates(page, effortPickerSelectors())) {
+    attempts.push({ ...picker.summary, kind: "picker", strategy: "strict-dom" });
+    const opened = await clickPickerCandidate(page, picker, 800);
+    if (!opened) continue;
+    await page.waitForTimeout(500);
+
+    const candidate = await bestStrictProLeafCandidate(page);
+    if (!candidate) {
+      attempts.push(...(await strictMenuCandidateSummaries(page)));
+      await page.keyboard.press("Escape").catch(() => {});
+      continue;
+    }
+
+    await page.mouse.click(candidate.center.x, candidate.center.y).catch(() => {});
+    await page.waitForTimeout(900);
+    const verified = await verifyProModeSelected(page, picker.summary);
+    if (verified.ok) {
+      return {
+        selected: true,
+        target_model: targetModel,
+        strategy: "strict-dom",
+        reason: `Clicked strict Pro leaf candidate: ${candidate.text}`,
+        picker: picker.summary,
+        candidate: candidate.summary,
+        verification: verified.selected,
+      };
+    }
+
+    attempts.push(candidate.summary, ...verified.candidates);
+    await page.keyboard.press("Escape").catch(() => {});
+  }
+
+  return {
+    selected: false,
+    target_model: targetModel,
+    strategy: "strict-dom",
+    reason: "No verified strict Pro leaf option was selected.",
+    visible_menu_candidates: dedupeSummaries(attempts).slice(0, 16),
+  };
+}
+
+async function selectProModeLegacyDom(page, targetModel = "GPT-5.5 Pro") {
   const attempts = [];
   const alreadyOpen = await chooseVisibleProMode(page, targetModel);
   if (alreadyOpen.selected) return alreadyOpen;
   attempts.push(...alreadyOpen.visible_menu_candidates);
 
-  const pickerSelectors = [
+  for (const picker of await pickerCandidates(page, effortPickerSelectors())) {
+    attempts.push({ ...picker.summary, kind: "picker" });
+    if (!(await clickPickerCandidate(page, picker, 1000))) continue;
+
+    await page.waitForTimeout(700);
+
+    const result = await chooseVisibleProMode(page, targetModel, picker.summary);
+    if (result.selected) return result;
+    attempts.push(...result.visible_menu_candidates);
+
+    await page.keyboard.press("Escape").catch(() => {});
+  }
+
+  return {
+    selected: false,
+    target_model: targetModel,
+    reason: `No high-confidence Pro-like option was found in the visible model/effort menu for ${targetModel}.`,
+    visible_menu_candidates: dedupeSummaries(attempts).slice(0, 16),
+  };
+}
+
+function effortPickerSelectors() {
+  return [
     '[data-testid="model-switcher-dropdown-button"]',
     '[data-testid*="model-switcher" i]',
     'button:has-text("지능")',
@@ -969,31 +1081,18 @@ async function selectProMode(page, targetModel = "GPT-5.5 Pro") {
     'button:has-text("GPT")',
     'button:has-text("ChatGPT")',
   ];
+}
 
-  for (const picker of await pickerCandidates(page, pickerSelectors)) {
-    attempts.push({ ...picker.summary, kind: "picker" });
-    if (picker.locator) {
-      if (!(await isVisible(picker.locator, 1000))) continue;
-      await picker.locator.click().catch(() => {});
-    } else {
-      await page.locator(`[data-pro-plugin-picker-candidate="${picker.marker}"]`).first().click().catch(() => {});
-    }
-
-    await page.waitForTimeout(700);
-
-    const result = await chooseVisibleProMode(page, targetModel, picker.summary);
-    if (result.selected) return result;
-    attempts.push(...result.visible_menu_candidates);
-
-    await page.keyboard.press("Escape").catch(() => {});
+async function clickPickerCandidate(page, picker, timeout) {
+  if (picker.locator) {
+    if (!(await isVisible(picker.locator, timeout))) return false;
+    await picker.locator.click().catch(() => {});
+    return true;
   }
-
-  return {
-    selected: false,
-    target_model: targetModel,
-    reason: `No high-confidence Pro-like option was found in the visible model/effort menu for ${targetModel}.`,
-    visible_menu_candidates: dedupeSummaries(attempts).slice(0, 16),
-  };
+  const locator = page.locator(`[data-pro-plugin-picker-candidate="${picker.marker}"]`).first();
+  if (!(await isVisible(locator, timeout))) return false;
+  await locator.click().catch(() => {});
+  return true;
 }
 
 async function chooseVisibleProMode(page, targetModel, pickerSummary) {
@@ -1128,6 +1227,148 @@ async function verifyProModeSelected(page, pickerSummary) {
     selected: selected?.summary || null,
     candidates: candidates.slice(0, 8).map((candidate) => candidate.summary),
   };
+}
+
+async function bestStrictProLeafCandidate(page) {
+  const candidates = await strictProLeafCandidates(page);
+  return candidates[0] || null;
+}
+
+async function strictMenuCandidateSummaries(page) {
+  return (await strictProLeafCandidates(page)).slice(0, 8).map((candidate) => candidate.summary);
+}
+
+async function strictProLeafCandidates(page) {
+  const candidates = await page.evaluate(() => {
+    const menuSelector = [
+      '[role="menu"]',
+      '[role="listbox"]',
+      '[role="dialog"]',
+      '[data-radix-popper-content-wrapper]',
+      "[data-side]",
+      "[popover]",
+    ].join(", ");
+    const rowSelector = [
+      '[role="menuitem"]',
+      '[role="option"]',
+      "button",
+      '[role="button"]',
+      "[tabindex]",
+      "div",
+      "span",
+    ].join(", ");
+
+    function visible(element) {
+      const rect = element.getBoundingClientRect();
+      const style = window.getComputedStyle(element);
+      return (
+        rect.width > 0 &&
+        rect.height > 0 &&
+        style.visibility !== "hidden" &&
+        style.display !== "none"
+      );
+    }
+
+    function compactText(element) {
+      return [
+        element.innerText,
+        element.textContent,
+        element.getAttribute("aria-label"),
+        element.getAttribute("title"),
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .replace(/\s+/g, " ")
+        .trim();
+    }
+
+    const roots = Array.from(document.querySelectorAll(menuSelector))
+      .filter((element) => element instanceof HTMLElement && visible(element));
+    const seen = new Set();
+    const results = [];
+
+    for (const root of roots) {
+      const nodes = Array.from(root.querySelectorAll(rowSelector))
+        .filter((element) => element instanceof HTMLElement && visible(element));
+
+      for (const element of nodes) {
+        const text = compactText(element);
+        if (!text || text.length > 80) continue;
+        if (!(/\bPro\b/i.test(text) || /프로/.test(text))) continue;
+        if (effortSignalCountInPage(text) >= 3) continue;
+        if (/(즉시|중간|높음|매우\s*높음|\bInstant\b|\bMedium\b|\bHigh\b|\bThinking\b)/i.test(text)) {
+          continue;
+        }
+
+        const rect = element.getBoundingClientRect();
+        const key = `${Math.round(rect.left)}:${Math.round(rect.top)}:${text}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+
+        const checked =
+          element.getAttribute("aria-checked") === "true" ||
+          element.getAttribute("aria-selected") === "true" ||
+          Boolean(element.querySelector('[aria-checked="true"], [aria-selected="true"]'));
+
+        results.push({
+          text,
+          role: element.getAttribute("role") || "",
+          checked,
+          center: {
+            x: rect.left + rect.width / 2,
+            y: rect.top + rect.height / 2,
+          },
+          rect: {
+            x: rect.left,
+            y: rect.top,
+            width: rect.width,
+            height: rect.height,
+          },
+        });
+      }
+    }
+
+    function effortSignalCountInPage(text) {
+      const signals = [
+        /\binstant\b/i,
+        /\bmedium\b/i,
+        /\bhigh\b/i,
+        /\bthinking\b/i,
+        /\bpro\b/i,
+        /즉시/,
+        /중간/,
+        /높음/,
+        /매우\s*높음/,
+        /프로/,
+        /확장/,
+        /GPT-?5(?:\.5)?/i,
+      ];
+      return signals.reduce((count, pattern) => count + (pattern.test(text) ? 1 : 0), 0);
+    }
+
+    return results;
+  });
+
+  return candidates
+    .map((candidate) => {
+      let score = 100;
+      if (/(확장|extended|expand|pro)/i.test(candidate.text)) score += 20;
+      if (candidate.checked) score += 10;
+      return {
+        ...candidate,
+        score,
+        has_pro: true,
+        summary: {
+          text: candidate.text,
+          score,
+          role: candidate.role,
+          checked: candidate.checked,
+          rect: candidate.rect,
+          source: "strict-dom-leaf",
+        },
+      };
+    })
+    .sort((left, right) => right.score - left.score);
 }
 
 async function pickerCandidates(page, fixedSelectors) {
