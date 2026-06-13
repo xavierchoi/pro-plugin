@@ -1,0 +1,34 @@
+{
+  "name": "pro-plugin",
+  "version": "0.1.0+codex.20260613084212",
+  "description": "Consult ChatGPT web Pro mode from Codex through a user-owned browser session.",
+  "author": {
+    "name": "xavier"
+  },
+  "license": "MIT",
+  "keywords": [
+    "chatgpt",
+    "pro",
+    "browser",
+    "oracle",
+    "mcp"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "ChatGPT Pro Oracle",
+    "shortDescription": "Ask ChatGPT Pro mode from Codex",
+    "longDescription": "Adds a local MCP companion tool that connects to a user-controlled Chrome or Chromium session over CDP, selects ChatGPT Pro mode when possible, submits a prompt, and returns the response to Codex.",
+    "developerName": "xavier",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive"
+    ],
+    "defaultPrompt": [
+      "Ask ChatGPT Pro for a second opinion",
+      "Use Pro mode to analyze this design",
+      "Compare Codex's answer with ChatGPT Pro"
+    ],
+    "brandColor": "#10A37F"
+  }
+}

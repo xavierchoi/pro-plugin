@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "chatgpt-pro-oracle": {
+      "command": "node",
+      "args": [
+        "scripts/chatgpt-pro-mcp.mjs"
+      ],
+      "cwd": ".",
+      "startup_timeout_sec": 20,
+      "tool_timeout_sec": 1800
+    }
+  }
+}

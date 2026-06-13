@@ -1,0 +1,13 @@
+{
+  "name": "pro-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Codex plugin that consults ChatGPT web Pro mode through a user-owned browser session.",
+  "scripts": {
+    "check": "node --check scripts/chatgpt-pro-mcp.mjs"
+  },
+  "dependencies": {
+    "playwright-core": "^1.56.0"
+  }
+}
