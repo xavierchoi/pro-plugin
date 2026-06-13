@@ -22,7 +22,13 @@ Then open `https://chatgpt.com` in that browser and log in. Select or make avail
 
 ### Comet
 
-Comet is Chromium-based, so the same CDP approach should work when Comet accepts Chromium flags. Start Comet with a dedicated debugging profile and the same port:
+Comet is Chromium-based, so the same CDP approach should work when Comet accepts Chromium flags. On macOS, the bundled launcher is the easiest path:
+
+```bash
+npm run start:comet
+```
+
+Or start Comet directly with a dedicated debugging profile and the same port:
 
 ```bash
 /Applications/Comet.app/Contents/MacOS/Comet \
@@ -50,8 +56,22 @@ Do not expose the debugging port to an untrusted network. CDP can control the br
 
 ## Tools
 
-- `chatgpt_pro_status`: checks that the CDP endpoint is reachable and whether a ChatGPT tab is visible.
+- `chatgpt_pro_status`: checks CDP reachability, SSH/tunnel hints, ChatGPT tab visibility, login/composer state, and visible model hints.
 - `ask_chatgpt_pro`: opens ChatGPT, tries to select Pro mode, submits a prompt, waits for the answer to stabilize, and returns the final text.
+
+Useful `ask_chatgpt_pro` options:
+
+- `target_model`: visible label to select, default `GPT-5.5 Pro`.
+- `session_name`: saves and reuses a ChatGPT conversation URL for follow-up questions.
+- `conversation_mode`: `new`, `current`, or `named`.
+- `long_prompt_strategy`: `chunk`, `fail`, or `truncate`; default `chunk`.
+- `max_prompt_chars`: single-message character budget before chunking.
+
+Recommended result format in Codex:
+
+1. ChatGPT Pro answer
+2. Codex assessment
+3. Final recommendation
 
 ## Notes
 

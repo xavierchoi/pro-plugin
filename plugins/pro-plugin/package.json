@@ -5,7 +5,8 @@
   "type": "module",
   "description": "Codex plugin that consults ChatGPT web Pro mode through a user-owned browser session.",
   "scripts": {
-    "check": "node --check scripts/chatgpt-pro-mcp.mjs"
+    "check": "node --check scripts/chatgpt-pro-mcp.mjs",
+    "start:comet": "bash scripts/start-comet-cdp.sh"
   },
   "dependencies": {
     "playwright-core": "^1.56.0"

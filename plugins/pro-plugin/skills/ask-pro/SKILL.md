@@ -40,6 +40,16 @@ If the tool reports that ChatGPT is not logged in, ask the user to open that bro
 When using the tool:
 
 - Prefer `conversation_mode: "new"` for isolated questions.
+- Use `session_name` with `conversation_mode: "named"` for a deliberate multi-turn Pro-mode review thread.
 - Use `require_pro_mode: true` unless the user says best-effort is acceptable.
+- Keep `long_prompt_strategy: "chunk"` for large diffs or logs unless the user explicitly wants fail-fast behavior.
 - Include enough context in the prompt because the web conversation is separate from the Codex thread.
 - Treat the returned answer as a second opinion, not as an authoritative source for current facts unless it cites verifiable sources.
+
+When reporting a Pro consultation, use this structure:
+
+1. `ChatGPT Pro`: summarize or quote the returned answer.
+2. `Codex assessment`: say where you agree, disagree, or see gaps.
+3. `Recommendation`: give the actionable conclusion for the user.
+
+For setup issues, call `chatgpt_pro_status` first and relay its `next_steps` instead of guessing.
